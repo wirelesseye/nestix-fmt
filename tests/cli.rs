@@ -220,6 +220,110 @@ fn check_reports_then_in_place_formatting_fixes_a_file() {
 }
 
 #[test]
+fn formatted_crlf_file_is_unchanged_and_passes_check() {
+    let directory = temp_dir("crlf-check");
+    let file = directory.join("view.rs");
+    let source = "layout! {\r\n    Root {\r\n        Child\r\n    }\r\n}\r\n";
+    fs::write(&file, source).unwrap();
+
+    assert!(
+        Command::new(binary())
+            .args(["--check", file.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(binary())
+            .arg(&file)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read(&file).unwrap(), source.as_bytes());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn formatting_preserves_crlf_line_endings() {
+    let directory = temp_dir("crlf-format");
+    let file = directory.join("view.rs");
+    fs::write(&file, "fn view(){\r\nlayout! {Root{Child}}\r\n}\r\n").unwrap();
+
+    assert!(
+        Command::new(binary())
+            .arg(&file)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let formatted = String::from_utf8(fs::read(&file).unwrap()).unwrap();
+    assert!(formatted.contains("\r\n"));
+    assert!(!formatted.replace("\r\n", "").contains('\n'));
+    assert!(
+        Command::new(binary())
+            .args(["--check", file.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn no_rustfmt_preserves_crlf_line_endings() {
+    let directory = temp_dir("crlf-no-rustfmt");
+    let file = directory.join("view.rs");
+    fs::write(&file, "fn view( ){\r\nlayout! {Root{Child}}\r\n}\r\n").unwrap();
+
+    assert!(
+        Command::new(binary())
+            .args(["--no-rustfmt", file.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let formatted = String::from_utf8(fs::read(&file).unwrap()).unwrap();
+    assert!(formatted.starts_with("fn view( ){\r\n"));
+    assert!(formatted.contains("\r\n"));
+    assert!(!formatted.replace("\r\n", "").contains('\n'));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn explicit_newline_style_overrides_the_source_style() {
+    let directory = temp_dir("newline-config");
+    let unix = directory.join("unix");
+    let windows = directory.join("windows");
+    fs::create_dir(&unix).unwrap();
+    fs::create_dir(&windows).unwrap();
+    fs::write(unix.join("rustfmt.toml"), "newline_style = \"Unix\"\n").unwrap();
+    fs::write(
+        windows.join("rustfmt.toml"),
+        "newline_style = \"Windows\"\n",
+    )
+    .unwrap();
+    let unix_file = unix.join("view.rs");
+    let windows_file = windows.join("view.rs");
+    fs::write(&unix_file, "layout! {Root{Child}}\r\n").unwrap();
+    fs::write(&windows_file, "layout! {Root{Child}}\n").unwrap();
+
+    assert!(
+        Command::new(binary())
+            .args([unix_file.to_str().unwrap(), windows_file.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let unix_formatted = String::from_utf8(fs::read(unix_file).unwrap()).unwrap();
+    let windows_formatted = String::from_utf8(fs::read(windows_file).unwrap()).unwrap();
+    assert!(!unix_formatted.contains("\r\n"));
+    assert!(windows_formatted.contains("\r\n"));
+    assert!(!windows_formatted.replace("\r\n", "").contains('\n'));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn directory_walk_skips_ignored_hidden_and_target_files() {
     let directory = temp_dir("walk");
     fs::create_dir(directory.join(".git")).unwrap();

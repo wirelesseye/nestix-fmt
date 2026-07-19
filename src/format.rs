@@ -15,6 +15,7 @@ struct FormatterConfig {
     max_width: usize,
     tab_spaces: usize,
     hard_tabs: bool,
+    newline_style: NewlineStyle,
     rustfmt_config_dir: Option<PathBuf>,
 }
 
@@ -24,7 +25,47 @@ impl Default for FormatterConfig {
             max_width: WIDTH,
             tab_spaces: TAB_SPACES,
             hard_tabs: false,
+            newline_style: NewlineStyle::Auto,
             rustfmt_config_dir: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewlineStyle {
+    Auto,
+    Native,
+    Unix,
+    Windows,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+impl NewlineStyle {
+    fn resolve(self, source: &str) -> LineEnding {
+        match self {
+            Self::Auto => detect_line_ending(source).unwrap_or(LineEnding::Lf),
+            Self::Native => LineEnding::native(),
+            Self::Unix => LineEnding::Lf,
+            Self::Windows => LineEnding::CrLf,
+        }
+    }
+}
+
+impl LineEnding {
+    fn native() -> Self {
+        if cfg!(windows) { Self::CrLf } else { Self::Lf }
+    }
+
+    fn apply(self, source: &str) -> String {
+        let source = normalize_newlines(source);
+        match self {
+            Self::Lf => source,
+            Self::CrLf => source.replace('\n', "\r\n"),
         }
     }
 }
@@ -91,13 +132,15 @@ pub fn format_source(
     } else {
         FormatterConfig::default()
     };
+    let line_ending = config.newline_style.resolve(source);
     FORMATTER_CONFIG.set(config);
+    let source = normalize_newlines(source);
     let source = if use_rustfmt {
-        rustfmt_source(source, path)?
+        rustfmt_source(&source, path)?
     } else {
-        source.to_owned()
+        source
     };
-    format_layouts_in_source(&source, path)
+    format_layouts_in_source(&source, path).map(|formatted| line_ending.apply(&formatted))
 }
 
 fn rustfmt_config(path: Option<&Path>) -> Result<FormatterConfig, String> {
@@ -131,6 +174,7 @@ fn rustfmt_config(path: Option<&Path>) -> Result<FormatterConfig, String> {
         max_width: config_usize(&output, "max_width")?,
         tab_spaces: config_usize(&output, "tab_spaces")?.max(1),
         hard_tabs: config_bool(&output, "hard_tabs")?,
+        newline_style: config_newline_style(&output)?,
         rustfmt_config_dir: config_dir,
     })
 }
@@ -161,6 +205,30 @@ fn config_bool(config: &str, name: &str) -> Result<bool, String> {
     config_value(config, name)?
         .parse()
         .map_err(|error| format!("invalid rustfmt `{name}` value: {error}"))
+}
+
+fn config_newline_style(config: &str) -> Result<NewlineStyle, String> {
+    match config_value(config, "newline_style")?.trim_matches('"') {
+        "Auto" => Ok(NewlineStyle::Auto),
+        "Native" => Ok(NewlineStyle::Native),
+        "Unix" => Ok(NewlineStyle::Unix),
+        "Windows" => Ok(NewlineStyle::Windows),
+        value => Err(format!("unknown rustfmt `newline_style` value `{value}`")),
+    }
+}
+
+fn detect_line_ending(source: &str) -> Option<LineEnding> {
+    source.match_indices('\n').next().map(|(index, _)| {
+        if index > 0 && source.as_bytes()[index - 1] == b'\r' {
+            LineEnding::CrLf
+        } else {
+            LineEnding::Lf
+        }
+    })
+}
+
+fn normalize_newlines(source: &str) -> String {
+    source.replace("\r\n", "\n")
 }
 
 fn max_width() -> usize {
@@ -259,7 +327,7 @@ fn rustfmt_source(source: &str, path: Option<&Path>) -> Result<String, String> {
         "--edition",
         "2024",
         "--config",
-        "skip_children=true",
+        "skip_children=true,newline_style=Unix",
     ]);
     if let Some(config_dir) = rustfmt_config_dir() {
         command.arg("--config-path").arg(config_dir);
@@ -1254,7 +1322,7 @@ fn format_rust_expression(
         "--edition",
         "2024",
         "--config",
-        &format!("max_width={rustfmt_width},hard_tabs=false,tab_spaces=4"),
+        &format!("max_width={rustfmt_width},hard_tabs=false,tab_spaces=4,newline_style=Unix"),
     ]);
     if let Some(config_dir) = rustfmt_config_dir() {
         command.arg("--config-path").arg(config_dir);
@@ -1295,7 +1363,7 @@ fn format_rust_statement(statement: &str, indent: usize) -> Option<String> {
         "--edition",
         "2024",
         "--config",
-        &format!("max_width={rustfmt_width},hard_tabs=false,tab_spaces=4"),
+        &format!("max_width={rustfmt_width},hard_tabs=false,tab_spaces=4,newline_style=Unix"),
     ]);
     if let Some(config_dir) = rustfmt_config_dir() {
         command.arg("--config-path").arg(config_dir);
