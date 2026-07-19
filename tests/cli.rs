@@ -42,6 +42,132 @@ fn stdin_formats_to_stdout() {
 }
 
 #[test]
+fn rustfmt_config_controls_rust_width_and_dsl_indentation() {
+    let directory = temp_dir("config");
+    fs::write(
+        directory.join("rustfmt.toml"),
+        "max_width = 50\ntab_spaces = 2\nuse_field_init_shorthand = true\n",
+    )
+    .unwrap();
+    let file = directory.join("view.rs");
+    fs::write(
+        &file,
+        "fn view(first: u8) { let _ = Example { first: first }; layout! {Root{Widget(.value=build_value(first_argument,second_argument,third_argument))}} }",
+    )
+    .unwrap();
+
+    let output = Command::new(binary()).arg(&file).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let formatted = fs::read_to_string(&file).unwrap();
+    assert!(formatted.contains("Example { first }"));
+    assert!(formatted.contains("\n    Root {\n      Widget("));
+    assert!(formatted.contains("build_value(\n"));
+    assert!(formatted.lines().all(|line| line.len() <= 50));
+
+    assert!(
+        Command::new(binary())
+            .arg(&file)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), formatted);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn hard_tabs_are_used_for_dsl_indentation() {
+    let directory = temp_dir("hard-tabs");
+    fs::write(
+        directory.join("rustfmt.toml"),
+        "hard_tabs = true\ntab_spaces = 4\n",
+    )
+    .unwrap();
+    let file = directory.join("view.rs");
+    fs::write(&file, "layout! {Root{Child}}").unwrap();
+
+    assert!(
+        Command::new(binary())
+            .arg(&file)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let formatted = fs::read_to_string(&file).unwrap();
+    assert_eq!(formatted, "layout! {\n\tRoot {\n\t\tChild\n\t}\n}\n");
+    assert!(
+        Command::new(binary())
+            .arg(&file)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), formatted);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn nested_files_use_the_nearest_rustfmt_config() {
+    let directory = temp_dir("nested-config");
+    let nested = directory.join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(directory.join("rustfmt.toml"), "tab_spaces = 2\n").unwrap();
+    fs::write(nested.join("rustfmt.toml"), "tab_spaces = 6\n").unwrap();
+    let outer = directory.join("outer.rs");
+    let inner = nested.join("inner.rs");
+    fs::write(&outer, "layout! {Root{Child}}").unwrap();
+    fs::write(&inner, "layout! {Root{Child}}").unwrap();
+
+    assert!(
+        Command::new(binary())
+            .arg(&directory)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        fs::read_to_string(outer)
+            .unwrap()
+            .contains("\n  Root {\n    Child")
+    );
+    assert!(
+        fs::read_to_string(inner)
+            .unwrap()
+            .contains("\n      Root {\n            Child")
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn stdin_reads_rustfmt_config_from_the_current_directory() {
+    let directory = temp_dir("stdin-config");
+    fs::write(directory.join("rustfmt.toml"), "tab_spaces = 2\n").unwrap();
+    let mut child = Command::new(binary())
+        .current_dir(&directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"layout! {Root{Child}}")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "layout! {\n  Root {\n    Child\n  }\n}\n"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn no_rustfmt_preserves_outer_rust_and_disables_embedded_rustfmt() {
     let mut child = Command::new(binary())
         .arg("--no-rustfmt")
@@ -141,6 +267,35 @@ fn parse_error_prevents_all_batch_writes() {
             .unwrap()
             .contains("b.rs:1:")
     );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn invalid_rustfmt_config_prevents_batch_writes_but_no_rustfmt_ignores_it() {
+    let directory = temp_dir("invalid-config");
+    fs::write(directory.join("rustfmt.toml"), "max_width = nope\n").unwrap();
+    let first = directory.join("a.rs");
+    let second = directory.join("b.rs");
+    fs::write(&first, "layout! {Root}").unwrap();
+    fs::write(&second, "layout! {Child}").unwrap();
+
+    let output = Command::new(binary()).arg(&directory).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read_to_string(&first).unwrap(), "layout! {Root}");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "layout! {Child}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to read rustfmt configuration")
+    );
+
+    assert!(
+        Command::new(binary())
+            .args(["--no-rustfmt", directory.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read_to_string(first).unwrap(), "layout! { Root }");
+    assert_eq!(fs::read_to_string(second).unwrap(), "layout! { Child }");
     fs::remove_dir_all(directory).unwrap();
 }
 

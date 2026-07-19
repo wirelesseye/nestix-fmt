@@ -1,16 +1,37 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use crate::syntax;
 
 const WIDTH: usize = 100;
+const TAB_SPACES: usize = 4;
+
+#[derive(Clone, Debug)]
+struct FormatterConfig {
+    max_width: usize,
+    tab_spaces: usize,
+    hard_tabs: bool,
+    rustfmt_config_dir: Option<PathBuf>,
+}
+
+impl Default for FormatterConfig {
+    fn default() -> Self {
+        Self {
+            max_width: WIDTH,
+            tab_spaces: TAB_SPACES,
+            hard_tabs: false,
+            rustfmt_config_dir: None,
+        }
+    }
+}
 
 thread_local! {
     static USE_RUSTFMT: Cell<bool> = const { Cell::new(true) };
+    static FORMATTER_CONFIG: RefCell<FormatterConfig> = RefCell::new(FormatterConfig::default());
 }
 
 pub fn ensure_rustfmt() -> Result<(), String> {
@@ -65,12 +86,93 @@ pub fn format_source(
     use_rustfmt: bool,
 ) -> Result<String, String> {
     USE_RUSTFMT.set(use_rustfmt);
+    let config = if use_rustfmt {
+        rustfmt_config(path)?
+    } else {
+        FormatterConfig::default()
+    };
+    FORMATTER_CONFIG.set(config);
     let source = if use_rustfmt {
         rustfmt_source(source, path)?
     } else {
         source.to_owned()
     };
     format_layouts_in_source(&source, path)
+}
+
+fn rustfmt_config(path: Option<&Path>) -> Result<FormatterConfig, String> {
+    let current_dir = std::env::current_dir()
+        .map_err(|error| format!("failed to determine current directory: {error}"))?;
+    let probe = match path {
+        Some(path) if path.is_absolute() => path.to_owned(),
+        Some(path) => current_dir.join(path),
+        None => current_dir.join("__nestix_fmt_stdin.rs"),
+    };
+    let search_dir = probe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| current_dir.clone());
+    let config_dir = rustfmt_config_directory(&search_dir);
+    let output = Command::new("rustfmt")
+        .args(["--print-config", "current"])
+        .arg(&probe)
+        .output()
+        .map_err(|error| format!("failed to read rustfmt configuration: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}: failed to read rustfmt configuration: {}",
+            path.map_or_else(|| "<stdin>".into(), |path| path.display().to_string()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let output = String::from_utf8(output.stdout)
+        .map_err(|error| format!("rustfmt configuration was not valid UTF-8: {error}"))?;
+    Ok(FormatterConfig {
+        max_width: config_usize(&output, "max_width")?,
+        tab_spaces: config_usize(&output, "tab_spaces")?.max(1),
+        hard_tabs: config_bool(&output, "hard_tabs")?,
+        rustfmt_config_dir: config_dir,
+    })
+}
+
+fn rustfmt_config_directory(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|directory| {
+        ["rustfmt.toml", ".rustfmt.toml"]
+            .into_iter()
+            .any(|name| directory.join(name).is_file())
+            .then(|| directory.to_owned())
+    })
+}
+
+fn config_value<'a>(config: &'a str, name: &str) -> Result<&'a str, String> {
+    config
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} = ")))
+        .ok_or_else(|| format!("rustfmt did not report `{name}` in its configuration"))
+}
+
+fn config_usize(config: &str, name: &str) -> Result<usize, String> {
+    config_value(config, name)?
+        .parse()
+        .map_err(|error| format!("invalid rustfmt `{name}` value: {error}"))
+}
+
+fn config_bool(config: &str, name: &str) -> Result<bool, String> {
+    config_value(config, name)?
+        .parse()
+        .map_err(|error| format!("invalid rustfmt `{name}` value: {error}"))
+}
+
+fn max_width() -> usize {
+    FORMATTER_CONFIG.with(|config| config.borrow().max_width)
+}
+
+fn tab_spaces() -> usize {
+    FORMATTER_CONFIG.with(|config| config.borrow().tab_spaces)
+}
+
+fn rustfmt_config_dir() -> Option<PathBuf> {
+    FORMATTER_CONFIG.with(|config| config.borrow().rustfmt_config_dir.clone())
 }
 
 fn format_layouts_in_source(source: &str, path: Option<&Path>) -> Result<String, String> {
@@ -99,7 +201,7 @@ fn format_layouts_in_source(source: &str, path: Option<&Path>) -> Result<String,
         let nodes = lex_nodes(&nested)
             .map_err(|error| diagnostic(path, source, invocation.body_start + error.0, &error.1))?;
         let base = line_indent(source, invocation.open_offset);
-        let formatted = format_layout(&nodes, base + 4)
+        let formatted = format_layout(&nodes, base + tab_spaces())
             .map_err(|error| diagnostic(path, source, invocation.body_start, &error))?;
         syntax::validate(&formatted).map_err(|error| {
             diagnostic(
@@ -114,7 +216,7 @@ fn format_layouts_in_source(source: &str, path: Option<&Path>) -> Result<String,
         } else if !body.contains('\n')
             && is_single_element(&nodes)
             && !formatted.contains('\n')
-            && base + formatted.trim().len() + "layout! {  }".len() <= WIDTH
+            && base + formatted.trim().len() + "layout! {  }".len() <= max_width()
         {
             output.push(' ');
             output.push_str(formatted.trim());
@@ -123,7 +225,7 @@ fn format_layouts_in_source(source: &str, path: Option<&Path>) -> Result<String,
             output.push('\n');
             output.push_str(&formatted);
             output.push('\n');
-            output.push_str(&" ".repeat(base));
+            output.push_str(&spaces(base));
         }
         cursor = invocation.body_end;
     }
@@ -150,15 +252,19 @@ fn is_single_element(nodes: &[Node]) -> bool {
 }
 
 fn rustfmt_source(source: &str, path: Option<&Path>) -> Result<String, String> {
-    let mut child = Command::new("rustfmt")
-        .args([
-            "--emit",
-            "stdout",
-            "--edition",
-            "2024",
-            "--config",
-            "max_width=100,hard_tabs=false,tab_spaces=4,skip_children=true",
-        ])
+    let mut command = Command::new("rustfmt");
+    command.args([
+        "--emit",
+        "stdout",
+        "--edition",
+        "2024",
+        "--config",
+        "skip_children=true",
+    ]);
+    if let Some(config_dir) = rustfmt_config_dir() {
+        command.arg("--config-path").arg(config_dir);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -408,8 +514,13 @@ fn line_indent(source: &str, offset: usize) -> usize {
     source[start..offset]
         .bytes()
         .take_while(|byte| *byte == b' ' || *byte == b'\t')
-        .map(|byte| if byte == b'\t' { 4 } else { 1 })
-        .sum()
+        .fold(0, |column, byte| {
+            if byte == b'\t' {
+                column + tab_spaces() - column % tab_spaces()
+            } else {
+                column + 1
+            }
+        })
 }
 
 fn diagnostic(path: Option<&Path>, source: &str, offset: usize, message: &str) -> String {
@@ -590,7 +701,7 @@ fn format_if(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<String
         .ok_or("expected block after `if` condition")?;
     let condition_nodes = &nodes[*cursor..branch];
     let condition_inline = inline(condition_nodes);
-    let condition = if USE_RUSTFMT.get() && indent + 3 + condition_inline.len() > WIDTH {
+    let condition = if USE_RUSTFMT.get() && indent + 3 + condition_inline.len() > max_width() {
         format_rust_expression(&condition_inline, indent + 3, indent)
             .unwrap_or_else(|| format_generic(condition_nodes, indent + 3))
     } else {
@@ -601,7 +712,7 @@ fn format_if(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<String
     let mut output = format!(
         "{}if {condition} {{\n{}\n{}}}",
         spaces(indent),
-        format_layout(then, indent + 4)?,
+        format_layout(then, indent + tab_spaces())?,
         spaces(indent)
     );
     if take(nodes, cursor, "else") {
@@ -617,7 +728,7 @@ fn format_if(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<String
             *cursor += 1;
             output.push_str(&format!(
                 " else {{\n{}\n{}}}",
-                format_layout(body, indent + 4)?,
+                format_layout(body, indent + tab_spaces())?,
                 spaces(indent)
             ));
         }
@@ -633,13 +744,13 @@ fn format_for(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<Strin
         .map(|offset| *cursor + offset)
         .ok_or("expected block after `for` header")?;
     let header_nodes = &nodes[*cursor..body_at];
-    let header = format_for_header(header_nodes, indent + 4);
+    let header = format_for_header(header_nodes, indent + tab_spaces());
     let body = nodes[body_at].group('{').unwrap();
     *cursor = body_at + 1;
     Ok(format!(
         "{}for {header} {{\n{}\n{}}}",
         spaces(indent),
-        format_layout(body, indent + 4)?,
+        format_layout(body, indent + tab_spaces())?,
         spaces(indent)
     ))
 }
@@ -749,7 +860,7 @@ fn format_element(
             output.push_str(" {}");
         } else {
             output.push_str(" {\n");
-            output.push_str(&format_layout(children, indent + 4)?);
+            output.push_str(&format_layout(children, indent + tab_spaces())?);
             output.push('\n');
             output.push_str(&spaces(indent));
             output.push('}');
@@ -852,11 +963,11 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize) -> String {
     let parts = split_commas(nodes);
     if !has_comments
         && !has_statement_block(nodes)
-        && indent + prefix_len + compact.len() + 2 <= WIDTH
+        && indent + prefix_len + compact.len() + 2 <= max_width()
     {
         return format!("({compact})");
     }
-    let child_indent = indent + 4;
+    let child_indent = indent + tab_spaces();
     let mut output = String::from("(\n");
     for part in parts {
         if part.is_empty() {
@@ -877,7 +988,7 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
         && !contains_comments(nodes)
         && !has_statement_block(nodes)
         && !has_nested_layout(nodes)
-        && indent + compact.len() <= WIDTH
+        && indent + compact.len() <= max_width()
     {
         return compact;
     }
@@ -922,8 +1033,9 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
             output.push(*open);
             output.push('\n');
             output.push_str(
-                &format_layout(body, indent + 4)
-                    .unwrap_or_else(|_| format!("{}{}", spaces(indent + 4), inline(body))),
+                &format_layout(body, indent + tab_spaces()).unwrap_or_else(|_| {
+                    format!("{}{}", spaces(indent + tab_spaces()), inline(body))
+                }),
             );
             output.push('\n');
             output.push_str(&spaces(indent));
@@ -1004,7 +1116,7 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
     if bang != "!" {
         return None;
     }
-    let child_indent = indent + 4;
+    let child_indent = indent + tab_spaces();
     let mut arguments = format_generic(arguments, child_indent);
     if macro_name == "callback" {
         arguments = arguments.replace(" | {", "| {");
@@ -1018,10 +1130,20 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
 }
 
 fn fits_width(text: &str, first_indent: usize) -> bool {
-    text.lines()
-        .enumerate()
-        .all(|(index, line)| index > 0 || first_indent + line.len() <= WIDTH)
-        && text.lines().skip(1).all(|line| line.len() <= WIDTH)
+    text.lines().enumerate().all(|(index, line)| {
+        let initial_column = if index == 0 { first_indent } else { 0 };
+        display_column(line, initial_column) <= max_width()
+    })
+}
+
+fn display_column(text: &str, initial_column: usize) -> usize {
+    text.bytes().fold(initial_column, |column, byte| {
+        if byte == b'\t' {
+            column + tab_spaces() - column % tab_spaces()
+        } else {
+            column + 1
+        }
+    })
 }
 
 fn format_rust_expression(
@@ -1031,20 +1153,24 @@ fn format_rust_expression(
 ) -> Option<String> {
     syn::parse_str::<syn::Expr>(expression).ok()?;
     let marker = "    let __nestix_value = ";
-    let rustfmt_width = WIDTH
+    let rustfmt_width = max_width()
         .saturating_add(marker.len())
         .saturating_sub(start_column)
         .max(40);
     let wrapper = format!("fn __nestix_fmt() {{\n    let __nestix_value = {expression};\n}}\n");
-    let mut child = Command::new("rustfmt")
-        .args([
-            "--emit",
-            "stdout",
-            "--edition",
-            "2024",
-            "--config",
-            &format!("max_width={rustfmt_width},hard_tabs=false,tab_spaces=4"),
-        ])
+    let mut command = Command::new("rustfmt");
+    command.args([
+        "--emit",
+        "stdout",
+        "--edition",
+        "2024",
+        "--config",
+        &format!("max_width={rustfmt_width},hard_tabs=false,tab_spaces=4"),
+    ]);
+    if let Some(config_dir) = rustfmt_config_dir() {
+        command.arg("--config-path").arg(config_dir);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1211,7 +1337,7 @@ fn has_top_level_statement(nodes: &[Node]) -> bool {
 }
 
 fn format_rust_block(nodes: &[Node], indent: usize) -> String {
-    let child_indent = indent + 4;
+    let child_indent = indent + tab_spaces();
     let mut output = String::from("{\n");
     let mut start = 0;
     for (index, node) in nodes.iter().enumerate() {
@@ -1281,7 +1407,15 @@ fn take(nodes: &[Node], cursor: &mut usize, expected: &str) -> bool {
 }
 
 fn spaces(count: usize) -> String {
-    " ".repeat(count)
+    FORMATTER_CONFIG.with(|config| {
+        let config = config.borrow();
+        if !config.hard_tabs {
+            return " ".repeat(count);
+        }
+        let tabs = count / config.tab_spaces;
+        let spaces = count % config.tab_spaces;
+        format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces))
+    })
 }
 
 #[cfg(test)]
