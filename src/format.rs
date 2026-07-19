@@ -715,11 +715,15 @@ fn format_element(
     output.push_str(&format!("{}{}", spaces(indent), prefix));
     if let Some(children) = nodes.get(*cursor).and_then(|node| node.group('{')) {
         *cursor += 1;
-        output.push_str(" {\n");
-        output.push_str(&format_layout(children, indent + 4)?);
-        output.push('\n');
-        output.push_str(&spaces(indent));
-        output.push('}');
+        if children.is_empty() {
+            output.push_str(" {}");
+        } else {
+            output.push_str(" {\n");
+            output.push_str(&format_layout(children, indent + 4)?);
+            output.push('\n');
+            output.push_str(&spaces(indent));
+            output.push('}');
+        }
     }
     Ok(output)
 }
@@ -1239,6 +1243,16 @@ mod tests {
     }
 }}"#;
         assert_eq!(format_dsl(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn keeps_empty_children_on_one_line() {
+        let input = "layout! { Root { Div{} Button(.disabled = true) { } } }";
+        let expected =
+            "layout! {\n    Root {\n        Div {}\n        Button(.disabled = true) {}\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
     }
 
     #[test]
