@@ -958,7 +958,15 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize) -> String {
     if nodes.is_empty() {
         return "()".into();
     }
-    let compact = format_generic(nodes, indent + prefix_len + 1);
+    let mut compact = inline(nodes);
+    if nodes.last().and_then(Node::token) == Some(",") {
+        compact = compact
+            .trim_end()
+            .strip_suffix(',')
+            .unwrap_or(compact.trim_end())
+            .trim_end()
+            .to_owned();
+    }
     let has_comments = contains_comments(nodes);
     let parts = split_commas(nodes);
     if !has_comments
@@ -1455,6 +1463,27 @@ mod tests {
             "layout! {\n    Root {\n        Div {}\n        Button(.disabled = true) {}\n    }\n}";
         let formatted = format_dsl(input).unwrap();
         assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn removes_a_trailing_comma_from_inline_props() {
+        let input = r#"layout! { TabViewItem(.id = "counter", .title = "Counter", ) { Counter } }"#;
+        let formatted = format_dsl(input).unwrap();
+        assert!(formatted.contains(r#"TabViewItem(.id = "counter", .title = "Counter") {"#));
+        assert!(!formatted.contains(r#".title = "Counter",) {"#));
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn retains_trailing_commas_in_multiline_props() {
+        let input = r#"layout! { Widget(.first_property_with_a_long_name = first_value_with_a_long_name, .second_property_with_a_long_name = second_value_with_a_long_name,) }"#;
+        let formatted = format_dsl(input).unwrap();
+        assert!(
+            formatted.contains(
+                "    .second_property_with_a_long_name = second_value_with_a_long_name,\n"
+            )
+        );
         assert_eq!(format_dsl(&formatted).unwrap(), formatted);
     }
 
