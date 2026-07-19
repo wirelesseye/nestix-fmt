@@ -1025,6 +1025,23 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
     let mut closure_pipe = false;
     let mut index = 0;
     while index < nodes.len() {
+        if nodes[index].token() == Some("format")
+            && nodes.get(index + 1).and_then(Node::token) == Some("!")
+            && let Some(arguments) = nodes.get(index + 2).and_then(|node| node.group('('))
+        {
+            let current_column = if let Some(line) = output.rsplit('\n').next() {
+                if output.contains('\n') {
+                    line.len()
+                } else {
+                    indent + line.len()
+                }
+            } else {
+                indent
+            };
+            output.push_str(&format_format_macro(arguments, current_column));
+            index += 3;
+            continue;
+        }
         if nodes[index].token() == Some("layout")
             && nodes.get(index + 1).and_then(Node::token) == Some("!")
             && let Some(Node::Group {
@@ -1064,7 +1081,7 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
                 }
             }
             Node::Group { open, close, nodes } => {
-                if *open == '{' && has_statement_block(nodes) {
+                if *open == '{' && (has_top_level_statement(nodes) || has_statement_block(nodes)) {
                     while output.ends_with(' ') {
                         output.pop();
                     }
@@ -1073,8 +1090,9 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
                     }
                     output.push_str(&format_rust_block(nodes, indent));
                 } else {
+                    let formatted = format_generic(nodes, indent);
                     output.push(*open);
-                    output.push_str(&format_generic(nodes, indent));
+                    output.push_str(&formatted);
                     output.push(*close);
                 }
             }
@@ -1083,6 +1101,23 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
         }
         index += 1;
     }
+    output
+}
+
+fn format_format_macro(nodes: &[Node], indent: usize) -> String {
+    let child_indent = indent + tab_spaces();
+    let parts = split_commas(nodes);
+    if parts.len() <= 1 && indent + inline(nodes).len() + 9 <= max_width() {
+        return format!("format!({})", inline(nodes));
+    }
+    let mut output = String::from("format!(\n");
+    for part in parts.into_iter().filter(|part| !part.is_empty()) {
+        output.push_str(&spaces(child_indent));
+        output.push_str(&format_generic(part, child_indent));
+        output.push_str(",\n");
+    }
+    output.push_str(&spaces(indent));
+    output.push(')');
     output
 }
 
@@ -1125,7 +1160,12 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
         return None;
     }
     let child_indent = indent + tab_spaces();
-    let mut arguments = format_generic(arguments, child_indent);
+    let mut arguments = if macro_name == "callback" {
+        format_callback_arguments(arguments, child_indent)
+            .unwrap_or_else(|| format_generic(arguments, child_indent))
+    } else {
+        format_generic(arguments, child_indent)
+    };
     if macro_name == "callback" {
         arguments = arguments.replace(" | {", "| {");
     }
@@ -1135,6 +1175,42 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
         arguments,
         spaces(indent)
     ))
+}
+
+fn format_callback_arguments(nodes: &[Node], indent: usize) -> Option<String> {
+    let captures = nodes.first()?.group('[')?;
+    let Node::Group {
+        open: '{',
+        nodes: body,
+        ..
+    } = nodes.last()?
+    else {
+        return None;
+    };
+    let closure = inline(&nodes[1..nodes.len() - 1]);
+    let compact_captures = inline(captures);
+    let mut output = if indent + compact_captures.len() + closure.len() + 5 <= max_width() {
+        format!("[{compact_captures}]")
+    } else {
+        let child_indent = indent + tab_spaces();
+        let mut captures_output = String::from("[\n");
+        for capture in split_commas(captures)
+            .into_iter()
+            .filter(|capture| !capture.is_empty())
+        {
+            captures_output.push_str(&spaces(child_indent));
+            captures_output.push_str(&inline(capture));
+            captures_output.push_str(",\n");
+        }
+        captures_output.push_str(&spaces(indent));
+        captures_output.push(']');
+        captures_output
+    };
+    output.push(' ');
+    output.push_str(closure.trim());
+    output.push(' ');
+    output.push_str(&format_rust_block(body, indent));
+    Some(output)
 }
 
 fn fits_width(text: &str, first_indent: usize) -> bool {
@@ -1204,6 +1280,48 @@ fn format_rust_expression(
     for line in lines {
         formatted.push('\n');
         formatted.push_str(&continuation);
+        formatted.push_str(line.strip_prefix("    ").unwrap_or(line));
+    }
+    Some(formatted)
+}
+
+fn format_rust_statement(statement: &str, indent: usize) -> Option<String> {
+    let rustfmt_width = max_width().saturating_sub(indent).saturating_add(4).max(20);
+    let wrapper = format!("fn __nestix_fmt() {{\n    {statement};\n}}\n");
+    let mut command = Command::new("rustfmt");
+    command.args([
+        "--emit",
+        "stdout",
+        "--edition",
+        "2024",
+        "--config",
+        &format!("max_width={rustfmt_width},hard_tabs=false,tab_spaces=4"),
+    ]);
+    if let Some(config_dir) = rustfmt_config_dir() {
+        command.arg("--config-path").arg(config_dir);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(wrapper.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output = String::from_utf8(output.stdout).ok()?;
+    let fragment = output
+        .strip_prefix("fn __nestix_fmt() {\n")?
+        .strip_suffix("\n}\n")?
+        .strip_prefix("    ")?
+        .strip_suffix(';')?;
+    let mut lines = fragment.lines();
+    let mut formatted = lines.next()?.to_owned();
+    for line in lines {
+        formatted.push('\n');
+        formatted.push_str(&spaces(indent));
         formatted.push_str(line.strip_prefix("    ").unwrap_or(line));
     }
     Some(formatted)
@@ -1356,8 +1474,12 @@ fn format_rust_block(nodes: &[Node], indent: usize) -> String {
     for (index, node) in nodes.iter().enumerate() {
         if node.token() == Some(";") {
             if start < index {
+                let statement = inline(&nodes[start..index]);
+                let formatted = format_rust_statement(&statement, child_indent)
+                    .filter(|formatted| fits_width(formatted, child_indent))
+                    .unwrap_or_else(|| format_generic(&nodes[start..index], child_indent));
                 output.push_str(&spaces(child_indent));
-                output.push_str(&format_generic(&nodes[start..index], child_indent));
+                output.push_str(&formatted);
                 output.push(';');
                 output.push('\n');
             }
@@ -1642,6 +1764,30 @@ mod tests {
                 .contains("if let Err(error) = context_menu.show(ContextMenuPosition::Cursor) {")
         );
         assert!(formatted.lines().all(|line| line.len() <= WIDTH));
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn wraps_long_statements_and_format_arguments_inside_callbacks() {
+        let input = r#"fn view() {
+    layout! {
+        Root {
+            Section {
+                Form {
+                    Actions {
+                        Button(
+                            .on_click = callback!([name, newsletter, notifications, density, country, volume, status] || { let country = country.get().unwrap_or_else(|| "not selected".to_string()); status.set(format!("Saved: name={:?}, newsletter={}, notifications={}, density={}, country={}, volume={:.0}", name.get(), newsletter.get(), notifications.get(), density.get(), country, volume.get())); }),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}"#;
+        let formatted = format_default(input).unwrap();
+        assert!(formatted.contains("let country"));
+        assert!(formatted.contains("format!(\n"));
+        assert!(!formatted.contains("concat!(\n"));
         assert_eq!(format_default(&formatted).unwrap(), formatted);
     }
 
