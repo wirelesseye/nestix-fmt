@@ -109,14 +109,44 @@ fn format_layouts_in_source(source: &str, path: Option<&Path>) -> Result<String,
                 &format!("formatter produced invalid layout syntax: {error}"),
             )
         })?;
-        output.push('\n');
-        output.push_str(&formatted);
-        output.push('\n');
-        output.push_str(&" ".repeat(base));
+        if nodes.is_empty() {
+            // An empty layout has no useful internal shape to preserve.
+        } else if !body.contains('\n')
+            && is_single_element(&nodes)
+            && !formatted.contains('\n')
+            && base + formatted.trim().len() + "layout! {  }".len() <= WIDTH
+        {
+            output.push(' ');
+            output.push_str(formatted.trim());
+            output.push(' ');
+        } else {
+            output.push('\n');
+            output.push_str(&formatted);
+            output.push('\n');
+            output.push_str(&" ".repeat(base));
+        }
         cursor = invocation.body_end;
     }
     output.push_str(&source[cursor..]);
     Ok(output)
+}
+
+fn is_single_element(nodes: &[Node]) -> bool {
+    let mut cursor = 0;
+    let yielded = take(nodes, &mut cursor, "yield");
+    if matches!(nodes.get(cursor), Some(Node::Comment(_))) {
+        return false;
+    }
+    if nodes.get(cursor).and_then(Node::token) == Some("$")
+        || (!yielded && matches!(nodes.get(cursor).and_then(Node::token), Some("if" | "for")))
+    {
+        return false;
+    }
+    if format_element(nodes, &mut cursor, 0, yielded).is_err() {
+        return false;
+    }
+    while take(nodes, &mut cursor, ",") {}
+    cursor == nodes.len()
 }
 
 fn rustfmt_source(source: &str, path: Option<&Path>) -> Result<String, String> {
@@ -1256,6 +1286,27 @@ mod tests {
     }
 
     #[test]
+    fn collapses_an_empty_layout_block() {
+        for input in ["layout! {}", "layout! { }", "layout! {\n\n}"] {
+            assert_eq!(format_dsl(input).unwrap(), "layout! {}");
+        }
+    }
+
+    #[test]
+    fn keeps_a_short_single_element_inline_when_already_inline() {
+        let input = "let view = layout! { ExampleApp };";
+        assert_eq!(format_dsl(input).unwrap(), input);
+    }
+
+    #[test]
+    fn keeps_a_short_single_element_multiline_when_already_multiline() {
+        let input = "let view = layout! {\n    ExampleApp\n};";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, input);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
     fn leaves_non_layout_source_untouched() {
         let input = "fn  odd_spacing( ) { let text = r#\"layout! { Nope }\"#; }\n";
         assert_eq!(format_dsl(input).unwrap(), input);
@@ -1266,7 +1317,15 @@ mod tests {
         let input = "fn  view( ){let value=1+2;layout! {Root}}";
         let formatted = format_default(input).unwrap();
         assert!(formatted.starts_with("fn view() {\n    let value = 1 + 2;"));
-        assert!(formatted.contains("layout! {\n        Root\n    }"));
+        assert!(formatted.contains("layout! { Root }"));
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn rustfmt_preserves_a_multiline_single_element_layout() {
+        let input = "fn view() {\n    layout! {\n        ExampleApp\n    }\n}\n";
+        let formatted = format_default(input).unwrap();
+        assert!(formatted.contains("layout! {\n        ExampleApp\n    }"));
         assert_eq!(format_default(&formatted).unwrap(), formatted);
     }
 

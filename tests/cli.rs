@@ -175,10 +175,9 @@ fn package_formats_only_the_selected_workspace_member() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        fs::read_to_string(directory.join("one/src/lib.rs"))
-            .unwrap()
-            .contains('\n')
+    assert_eq!(
+        fs::read_to_string(directory.join("one/src/lib.rs")).unwrap(),
+        "layout! { Root }"
     );
     assert_eq!(
         fs::read_to_string(directory.join("two/src/lib.rs")).unwrap(),
@@ -208,15 +207,13 @@ fn all_includes_local_path_dependencies() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        fs::read_to_string(directory.join("app/src/lib.rs"))
-            .unwrap()
-            .contains('\n')
+    assert_eq!(
+        fs::read_to_string(directory.join("app/src/lib.rs")).unwrap(),
+        "layout! { Root }"
     );
-    assert!(
-        fs::read_to_string(directory.join("dependency/src/lib.rs"))
-            .unwrap()
-            .contains('\n')
+    assert_eq!(
+        fs::read_to_string(directory.join("dependency/src/lib.rs")).unwrap(),
+        "layout! { Root }"
     );
     fs::remove_dir_all(directory).unwrap();
 }
@@ -239,10 +236,9 @@ fn manifest_path_selects_a_manifest_outside_the_current_directory() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        fs::read_to_string(directory.join("app/src/lib.rs"))
-            .unwrap()
-            .contains('\n')
+    assert_eq!(
+        fs::read_to_string(directory.join("app/src/lib.rs")).unwrap(),
+        "layout! { Root }"
     );
     fs::remove_dir_all(directory).unwrap();
 }
