@@ -5,7 +5,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    thread,
 };
 
 use crate::syntax;
@@ -182,15 +183,9 @@ pub fn format_files(files: &[(PathBuf, String)], use_rustfmt: bool) -> Vec<Resul
             .collect();
         match rustfmt_sources(&sources, config_dir.as_deref()) {
             Ok(formatted_sources) => {
-                for (index, rust_source) in indices.into_iter().zip(formatted_sources) {
-                    let (path, original) = &files[index];
-                    let line_ending = config.newline_style.resolve(original);
-                    USE_RUSTFMT.set(true);
-                    FORMATTER_CONFIG.set(config.clone());
-                    results[index] = Some(
-                        format_layouts_in_source(&rust_source, Some(path))
-                            .map(|formatted| line_ending.apply(&formatted)),
-                    );
+                let work: Vec<_> = indices.into_iter().zip(formatted_sources).collect();
+                for (index, result) in format_layout_files(files, &work, &config) {
+                    results[index] = Some(result);
                 }
             }
             Err(error) => {
@@ -205,6 +200,47 @@ pub fn format_files(files: &[(PathBuf, String)], use_rustfmt: bool) -> Vec<Resul
         .into_iter()
         .map(|result| result.expect("every file belongs to a rustfmt configuration group"))
         .collect()
+}
+
+fn format_layout_files(
+    files: &[(PathBuf, String)],
+    work: &[(usize, String)],
+    config: &FormatterConfig,
+) -> Vec<(usize, Result<String, String>)> {
+    let workers = thread::available_parallelism()
+        .map_or(1, |parallelism| parallelism.get())
+        .min(16)
+        .min(work.len());
+
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        let work_index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((index, rust_source)) = work.get(work_index) else {
+                            break;
+                        };
+                        let (path, original) = &files[*index];
+                        let line_ending = config.newline_style.resolve(original);
+                        USE_RUSTFMT.set(true);
+                        FORMATTER_CONFIG.set(config.clone());
+                        let result = format_layouts_in_source(rust_source, Some(path))
+                            .map(|formatted| line_ending.apply(&formatted));
+                        results.push((*index, result));
+                    }
+                    results
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("layout formatting worker panicked"))
+            .collect()
+    })
 }
 
 fn rustfmt_config(path: Option<&Path>) -> Result<FormatterConfig, String> {
@@ -1216,7 +1252,8 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
     {
         return compact;
     }
-    if !contains_comments(nodes)
+    if USE_RUSTFMT.get()
+        && !contains_comments(nodes)
         && !has_nested_layout(nodes)
         && let Some(formatted) = format_rust_expression(&compact, indent, indent)
         && fits_width(&formatted, indent)
@@ -1691,7 +1728,10 @@ fn format_rust_block(nodes: &[Node], indent: usize) -> String {
         if node.token() == Some(";") {
             if start < index {
                 let statement = inline(&nodes[start..index]);
-                let formatted = format_rust_statement(&statement, child_indent)
+                let formatted = USE_RUSTFMT
+                    .get()
+                    .then(|| format_rust_statement(&statement, child_indent))
+                    .flatten()
                     .filter(|formatted| fits_width(formatted, child_indent))
                     .unwrap_or_else(|| format_generic(&nodes[start..index], child_indent));
                 output.push_str(&spaces(child_indent));
