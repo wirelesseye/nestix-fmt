@@ -143,3 +143,106 @@ fn parse_error_prevents_all_batch_writes() {
     );
     fs::remove_dir_all(directory).unwrap();
 }
+
+fn make_package(root: &std::path::Path, name: &str) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "layout! {Root}").unwrap();
+}
+
+#[test]
+fn package_formats_only_the_selected_workspace_member() {
+    let directory = temp_dir("package");
+    make_package(&directory.join("one"), "one");
+    make_package(&directory.join("two"), "two");
+    fs::write(
+        directory.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"one\", \"two\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(binary())
+        .current_dir(&directory)
+        .args(["--no-rustfmt", "--package", "one"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(directory.join("one/src/lib.rs"))
+            .unwrap()
+            .contains('\n')
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join("two/src/lib.rs")).unwrap(),
+        "layout! {Root}"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn all_includes_local_path_dependencies() {
+    let directory = temp_dir("all");
+    make_package(&directory.join("app"), "app");
+    make_package(&directory.join("dependency"), "dependency");
+    fs::write(
+        directory.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndependency = { path = \"../dependency\" }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(binary())
+        .current_dir(directory.join("app"))
+        .args(["--no-rustfmt", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(directory.join("app/src/lib.rs"))
+            .unwrap()
+            .contains('\n')
+    );
+    assert!(
+        fs::read_to_string(directory.join("dependency/src/lib.rs"))
+            .unwrap()
+            .contains('\n')
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn manifest_path_selects_a_manifest_outside_the_current_directory() {
+    let directory = temp_dir("manifest");
+    make_package(&directory.join("app"), "app");
+    let manifest = directory.join("app/Cargo.toml");
+
+    let output = Command::new(binary())
+        .current_dir(std::env::temp_dir())
+        .arg("--no-rustfmt")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(directory.join("app/src/lib.rs"))
+            .unwrap()
+            .contains('\n')
+    );
+    fs::remove_dir_all(directory).unwrap();
+}

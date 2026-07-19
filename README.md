@@ -9,6 +9,12 @@ nestix-fmt src
 # Check formatting without writing files.
 nestix-fmt --check src
 
+# Format one package, a manifest's default package(s), or the whole workspace
+# plus its local path dependencies (as with cargo fmt).
+nestix-fmt --package nestix
+nestix-fmt --manifest-path path/to/Cargo.toml
+nestix-fmt --all
+
 # Format the layout DSL without invoking rustfmt.
 nestix-fmt --no-rustfmt src
 

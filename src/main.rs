@@ -6,7 +6,7 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode},
 };
 
 use clap::Parser;
@@ -23,8 +23,20 @@ struct Args {
     #[arg(long)]
     no_rustfmt: bool,
 
+    /// Format the specified Cargo package.
+    #[arg(short = 'p', long = "package", value_name = "SPEC", action = clap::ArgAction::Append)]
+    packages: Vec<String>,
+
+    /// Path to Cargo.toml.
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+
+    /// Format all packages and local path dependencies.
+    #[arg(long, conflicts_with = "packages")]
+    all: bool,
+
     /// Rust files or directories. Reads stdin when omitted.
-    #[arg(value_name = "PATH")]
+    #[arg(value_name = "PATH", conflicts_with_all = ["packages", "manifest_path", "all"])]
     paths: Vec<PathBuf>,
 }
 
@@ -42,7 +54,8 @@ fn run(args: Args) -> Result<ExitCode, String> {
     if !args.no_rustfmt {
         format::ensure_rustfmt()?;
     }
-    if args.paths.is_empty() {
+    let cargo_mode = !args.packages.is_empty() || args.manifest_path.is_some() || args.all;
+    if args.paths.is_empty() && !cargo_mode {
         let mut source = String::new();
         io::stdin()
             .read_to_string(&mut source)
@@ -59,7 +72,12 @@ fn run(args: Args) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let files = discover(&args.paths)?;
+    let roots = if cargo_mode {
+        cargo_package_roots(&args)?
+    } else {
+        args.paths.clone()
+    };
+    let files = discover(&roots)?;
     let mut pending = Vec::new();
     let mut had_errors = false;
 
@@ -100,6 +118,114 @@ fn run(args: Args) -> Result<ExitCode, String> {
             .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cargo_package_roots(args: &Args) -> Result<Vec<PathBuf>, String> {
+    let mut command = Command::new("cargo");
+    command.args(["metadata", "--format-version", "1"]);
+    if let Some(path) = &args.manifest_path {
+        command.arg("--manifest-path").arg(path);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to start cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid cargo metadata: {error}"))?;
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or_else(|| "cargo metadata did not return packages".to_owned())?;
+    let workspace_members: BTreeSet<&str> = metadata["workspace_members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str())
+        .collect();
+
+    let selected: BTreeSet<&str> = if !args.packages.is_empty() {
+        let mut ids = BTreeSet::new();
+        for spec in &args.packages {
+            let matches: Vec<_> = packages
+                .iter()
+                .filter(|package| {
+                    package["id"]
+                        .as_str()
+                        .is_some_and(|id| workspace_members.contains(id))
+                })
+                .filter(|package| package["name"].as_str() == Some(spec.as_str()))
+                .filter_map(|package| package["id"].as_str())
+                .collect();
+            match matches.as_slice() {
+                [id] => {
+                    ids.insert(*id);
+                }
+                [] => {
+                    return Err(format!(
+                        "package `{spec}` is not a member of this workspace"
+                    ));
+                }
+                _ => return Err(format!("package specification `{spec}` is ambiguous")),
+            }
+        }
+        ids
+    } else if args.all {
+        packages
+            .iter()
+            .filter(|package| package["source"].is_null())
+            .filter_map(|package| package["id"].as_str())
+            .collect()
+    } else {
+        default_package_ids(&metadata, packages, &workspace_members)?
+    };
+
+    packages
+        .iter()
+        .filter(|package| {
+            package["id"]
+                .as_str()
+                .is_some_and(|id| selected.contains(id))
+        })
+        .map(|package| {
+            package["manifest_path"]
+                .as_str()
+                .and_then(|path| Path::new(path).parent())
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "cargo metadata returned an invalid manifest path".to_owned())
+        })
+        .collect()
+}
+
+fn default_package_ids<'a>(
+    metadata: &'a serde_json::Value,
+    packages: &'a [serde_json::Value],
+    workspace_members: &BTreeSet<&'a str>,
+) -> Result<BTreeSet<&'a str>, String> {
+    let current = std::env::current_dir().map_err(|error| error.to_string())?;
+    if let Some(package) = packages
+        .iter()
+        .filter(|package| {
+            package["id"]
+                .as_str()
+                .is_some_and(|id| workspace_members.contains(id))
+        })
+        .filter(|package| {
+            package["manifest_path"]
+                .as_str()
+                .and_then(|path| Path::new(path).parent())
+                .is_some_and(|root| current.starts_with(root))
+        })
+        .max_by_key(|package| package["manifest_path"].as_str().map_or(0, str::len))
+    {
+        return Ok([package["id"].as_str().unwrap()].into_iter().collect());
+    }
+    Ok(metadata["workspace_default_members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str())
+        .collect())
 }
 
 fn discover(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
