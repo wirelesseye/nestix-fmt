@@ -884,6 +884,7 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
     if !contains_comments(nodes)
         && !has_nested_layout(nodes)
         && let Some(formatted) = format_rust_expression(&compact, indent, indent)
+        && fits_width(&formatted, indent)
     {
         return formatted;
     }
@@ -980,9 +981,47 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
     }
     let left = inline(left);
     let left = left.trim_end();
-    let expression = inline(&nodes[separator + 1..]);
-    let expression = format_rust_expression(&expression, indent + left.len() + 1, indent)?;
-    Some(format!("{left} {expression}"))
+    let expression_nodes = &nodes[separator + 1..];
+    let expression = inline(expression_nodes);
+    if let Some(formatted) = format_rust_expression(&expression, indent + left.len() + 1, indent)
+        && fits_width(&format!("{left} {formatted}"), indent)
+    {
+        return Some(format!("{left} {formatted}"));
+    }
+
+    let [
+        Node::Token(macro_name),
+        Node::Token(bang),
+        Node::Group {
+            open: '(',
+            close: ')',
+            nodes: arguments,
+        },
+    ] = expression_nodes
+    else {
+        return None;
+    };
+    if bang != "!" {
+        return None;
+    }
+    let child_indent = indent + 4;
+    let mut arguments = format_generic(arguments, child_indent);
+    if macro_name == "callback" {
+        arguments = arguments.replace(" | {", "| {");
+    }
+    Some(format!(
+        "{left} {macro_name}!(\n{}{}\n{})",
+        spaces(child_indent),
+        arguments,
+        spaces(indent)
+    ))
+}
+
+fn fits_width(text: &str, first_indent: usize) -> bool {
+    text.lines()
+        .enumerate()
+        .all(|(index, line)| index > 0 || first_indent + line.len() <= WIDTH)
+        && text.lines().skip(1).all(|line| line.len() <= WIDTH)
 }
 
 fn format_rust_expression(
@@ -1390,6 +1429,30 @@ mod tests {
         assert!(formatted.contains("callback!(\n"));
         assert!(formatted.contains("state.update(|value| *value += 1);"));
         assert!(formatted.contains("notify_every_interested_observer_with_a_long_name(\n"));
+        assert!(formatted.lines().all(|line| line.len() <= WIDTH));
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn wraps_a_callback_with_dsl_capture_syntax_at_its_actual_indent() {
+        let input = r#"fn view() {
+    layout! {
+        Div {
+            if editing {
+                Input(
+                    .value = value.clone(),
+                    .on_value_change = callback!([key, props.set_content] |value: String| { set_content(&key.get(), value); }),
+                )
+            }
+        }
+    }
+}"#;
+        let formatted = format_default(input).unwrap();
+        assert!(formatted.contains(".on_value_change = callback!(\n"));
+        assert!(
+            formatted
+                .contains("                        [key, props.set_content] |value: String| {")
+        );
         assert!(formatted.lines().all(|line| line.len() <= WIDTH));
         assert_eq!(format_default(&formatted).unwrap(), formatted);
     }
