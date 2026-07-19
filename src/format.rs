@@ -1,8 +1,11 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::syntax;
@@ -143,6 +146,67 @@ pub fn format_source(
     format_layouts_in_source(&source, path).map(|formatted| line_ending.apply(&formatted))
 }
 
+/// Formats files in a batch so the ordinary Rust pass only starts rustfmt once
+/// per distinct rustfmt configuration instead of once per file.
+pub fn format_files(files: &[(PathBuf, String)], use_rustfmt: bool) -> Vec<Result<String, String>> {
+    if !use_rustfmt {
+        return files
+            .iter()
+            .map(|(path, source)| format_source(source, Some(path), false))
+            .collect();
+    }
+
+    let mut results: Vec<Option<Result<String, String>>> = vec![None; files.len()];
+    let mut groups: BTreeMap<Option<PathBuf>, Vec<usize>> = BTreeMap::new();
+    for (index, (path, _)) in files.iter().enumerate() {
+        groups
+            .entry(rustfmt_config_directory_for_path(path))
+            .or_default()
+            .push(index);
+    }
+
+    for (config_dir, indices) in groups {
+        let config = match rustfmt_config_for_directory(config_dir.as_deref(), &files[indices[0]].0)
+        {
+            Ok(config) => config,
+            Err(error) => {
+                for index in indices {
+                    results[index] = Some(Err(error.clone()));
+                }
+                continue;
+            }
+        };
+        let sources: Vec<_> = indices
+            .iter()
+            .map(|index| normalize_newlines(&files[*index].1))
+            .collect();
+        match rustfmt_sources(&sources, config_dir.as_deref()) {
+            Ok(formatted_sources) => {
+                for (index, rust_source) in indices.into_iter().zip(formatted_sources) {
+                    let (path, original) = &files[index];
+                    let line_ending = config.newline_style.resolve(original);
+                    USE_RUSTFMT.set(true);
+                    FORMATTER_CONFIG.set(config.clone());
+                    results[index] = Some(
+                        format_layouts_in_source(&rust_source, Some(path))
+                            .map(|formatted| line_ending.apply(&formatted)),
+                    );
+                }
+            }
+            Err(error) => {
+                for index in indices {
+                    results[index] = Some(Err(format!("{}: {error}", files[index].0.display())));
+                }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|result| result.expect("every file belongs to a rustfmt configuration group"))
+        .collect()
+}
+
 fn rustfmt_config(path: Option<&Path>) -> Result<FormatterConfig, String> {
     let current_dir = std::env::current_dir()
         .map_err(|error| format!("failed to determine current directory: {error}"))?;
@@ -156,15 +220,36 @@ fn rustfmt_config(path: Option<&Path>) -> Result<FormatterConfig, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| current_dir.clone());
     let config_dir = rustfmt_config_directory(&search_dir);
+    rustfmt_config_for_directory(config_dir.as_deref(), &probe)
+}
+
+fn rustfmt_config_directory_for_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_owned(), |cwd| cwd.join(path))
+    };
+    absolute.parent().and_then(rustfmt_config_directory)
+}
+
+fn rustfmt_config_for_directory(
+    config_dir: Option<&Path>,
+    probe: &Path,
+) -> Result<FormatterConfig, String> {
+    // With no config file rustfmt's stable defaults exactly match ours. Avoid
+    // an otherwise surprisingly expensive `--print-config` process per run.
+    let Some(config_dir) = config_dir else {
+        return Ok(FormatterConfig::default());
+    };
     let output = Command::new("rustfmt")
         .args(["--print-config", "current"])
-        .arg(&probe)
+        .arg(probe)
         .output()
         .map_err(|error| format!("failed to read rustfmt configuration: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "{}: failed to read rustfmt configuration: {}",
-            path.map_or_else(|| "<stdin>".into(), |path| path.display().to_string()),
+            probe.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -175,7 +260,7 @@ fn rustfmt_config(path: Option<&Path>) -> Result<FormatterConfig, String> {
         tab_spaces: config_usize(&output, "tab_spaces")?.max(1),
         hard_tabs: config_bool(&output, "hard_tabs")?,
         newline_style: config_newline_style(&output)?,
-        rustfmt_config_dir: config_dir,
+        rustfmt_config_dir: Some(config_dir.to_owned()),
     })
 }
 
@@ -357,6 +442,69 @@ fn rustfmt_source(source: &str, path: Option<&Path>) -> Result<String, String> {
     }
     String::from_utf8(output.stdout)
         .map_err(|error| format!("rustfmt returned invalid UTF-8: {error}"))
+}
+
+static TEMP_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn create() -> Result<Self, String> {
+        let counter = TEMP_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("nestix-fmt-batch-{}-{counter}", std::process::id()));
+        fs::create_dir(&path)
+            .map_err(|error| format!("failed to create temporary directory: {error}"))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn rustfmt_sources(sources: &[String], config_dir: Option<&Path>) -> Result<Vec<String>, String> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let temporary = TemporaryDirectory::create()?;
+    let paths: Vec<_> = (0..sources.len())
+        .map(|index| temporary.0.join(format!("{index}.rs")))
+        .collect();
+    for (path, source) in paths.iter().zip(sources) {
+        fs::write(path, source)
+            .map_err(|error| format!("failed to stage source for rustfmt: {error}"))?;
+    }
+
+    let mut command = Command::new("rustfmt");
+    command.args([
+        "--edition",
+        "2024",
+        "--config",
+        "skip_children=true,newline_style=Unix",
+    ]);
+    if let Some(config_dir) = config_dir {
+        command.arg("--config-path").arg(config_dir);
+    }
+    let output = command
+        .args(&paths)
+        .output()
+        .map_err(|error| format!("failed to start rustfmt: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustfmt failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    paths
+        .iter()
+        .map(|path| {
+            fs::read_to_string(path)
+                .map_err(|error| format!("failed to read formatted source: {error}"))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]

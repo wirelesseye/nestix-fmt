@@ -81,6 +81,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
     let mut pending = Vec::new();
     let mut had_errors = false;
 
+    let mut sources = Vec::with_capacity(files.len());
     for path in files {
         let source = match fs::read_to_string(&path) {
             Ok(source) => source,
@@ -90,7 +91,12 @@ fn run(args: Args) -> Result<ExitCode, String> {
                 continue;
             }
         };
-        match format::format_source(&source, Some(&path), !args.no_rustfmt) {
+        sources.push((path, source));
+    }
+
+    let formatted = format::format_files(&sources, !args.no_rustfmt);
+    for ((path, source), result) in sources.into_iter().zip(formatted) {
+        match result {
             Ok(formatted) if formatted != source => pending.push((path, formatted)),
             Ok(_) => {}
             Err(error) => {
