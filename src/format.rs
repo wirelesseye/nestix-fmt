@@ -1064,7 +1064,7 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
                 }
             }
             Node::Group { open, close, nodes } => {
-                if *open == '{' && has_top_level_statement(nodes) {
+                if *open == '{' && has_statement_block(nodes) {
                     while output.ends_with(' ') {
                         output.pop();
                     }
@@ -1161,10 +1161,15 @@ fn format_rust_expression(
 ) -> Option<String> {
     syn::parse_str::<syn::Expr>(expression).ok()?;
     let marker = "    let __nestix_value = ";
-    let rustfmt_width = max_width()
+    let first_line_width = max_width()
         .saturating_add(marker.len())
-        .saturating_sub(start_column)
-        .max(40);
+        .saturating_sub(start_column);
+    // Continuation lines are indented four columns inside the synthetic
+    // function, then moved to the real continuation indent.
+    let continuation_width = max_width()
+        .saturating_sub(continuation_indent)
+        .saturating_add(4);
+    let rustfmt_width = first_line_width.min(continuation_width).max(20);
     let wrapper = format!("fn __nestix_fmt() {{\n    let __nestix_value = {expression};\n}}\n");
     let mut command = Command::new("rustfmt");
     command.args([
@@ -1615,6 +1620,26 @@ mod tests {
         assert!(
             formatted
                 .contains("                        [key, props.set_content] |value: String| {")
+        );
+        assert!(formatted.lines().all(|line| line.len() <= WIDTH));
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn wraps_a_callback_block_with_a_nested_if_expression() {
+        let input = r#"fn view() {
+    layout! {
+        Button(
+            .title = "Show context menu",
+            .on_click = callback!([context_menu, status] || { if let Err(error) = context_menu.show(ContextMenuPosition::Cursor) { status.set(format!("Could not show menu: {error}")); } }),
+        )
+    }
+}"#;
+        let formatted = format_default(input).unwrap();
+        assert!(formatted.contains("[context_menu, status] || {\n"));
+        assert!(
+            formatted
+                .contains("if let Err(error) = context_menu.show(ContextMenuPosition::Cursor) {")
         );
         assert!(formatted.lines().all(|line| line.len() <= WIDTH));
         assert_eq!(format_default(&formatted).unwrap(), formatted);
