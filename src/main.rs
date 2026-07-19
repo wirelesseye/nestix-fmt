@@ -19,6 +19,10 @@ struct Args {
     #[arg(long)]
     check: bool,
 
+    /// Disable rustfmt for both the complete source and Rust inside layout DSL.
+    #[arg(long)]
+    no_rustfmt: bool,
+
     /// Rust files or directories. Reads stdin when omitted.
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
@@ -35,12 +39,15 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> Result<ExitCode, String> {
+    if !args.no_rustfmt {
+        format::ensure_rustfmt()?;
+    }
     if args.paths.is_empty() {
         let mut source = String::new();
         io::stdin()
             .read_to_string(&mut source)
             .map_err(|error| format!("failed to read stdin: {error}"))?;
-        let formatted = format::format_source(&source, None)?;
+        let formatted = format::format_source(&source, None, !args.no_rustfmt)?;
         if args.check {
             return Ok(if source == formatted {
                 ExitCode::SUCCESS
@@ -65,7 +72,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
                 continue;
             }
         };
-        match format::format_source(&source, Some(&path)) {
+        match format::format_source(&source, Some(&path), !args.no_rustfmt) {
             Ok(formatted) if formatted != source => pending.push((path, formatted)),
             Ok(_) => {}
             Err(error) => {

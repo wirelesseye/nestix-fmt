@@ -37,8 +37,29 @@ fn stdin_formats_to_stdout() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "fn view(){layout! {\n    Root {\n        Child\n    }\n}}"
+        "fn view() {\n    layout! {\n        Root {\n            Child\n        }\n    }\n}\n"
     );
+}
+
+#[test]
+fn no_rustfmt_preserves_outer_rust_and_disables_embedded_rustfmt() {
+    let mut child = Command::new(binary())
+        .arg("--no-rustfmt")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"fn view( ){layout! {Root{Widget(.value=long_call(first,second,third))}}}")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let formatted = String::from_utf8(output.stdout).unwrap();
+    assert!(formatted.starts_with("fn view( ){layout! {"));
+    assert!(formatted.contains("Widget(.value = long_call(first,"));
 }
 
 #[test]
