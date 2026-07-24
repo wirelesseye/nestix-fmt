@@ -1382,7 +1382,10 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
         return None;
     }
     let left = &nodes[..=separator];
-    let is_dsl_prefix = left.first().and_then(Node::token) == Some(".")
+    let is_dsl_prefix = matches!(
+        left.first().and_then(Node::token),
+        Some(".") | Some("$")
+    )
         || left.iter().any(|node| node.token() == Some(":"));
     if !is_dsl_prefix {
         return None;
@@ -1867,6 +1870,16 @@ mod tests {
                 "    .second_property_with_a_long_name = second_value_with_a_long_name,\n"
             )
         );
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_layout_if_directives_with_props() {
+        let input =
+            r#"layout! { Root { Widget(.value=value.clone(),$if=show.get()){Child} } }"#;
+        let expected = "layout! {\n    Root {\n        Widget(.value = value.clone(), $if = show.get()) {\n            Child\n        }\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
         assert_eq!(format_dsl(&formatted).unwrap(), formatted);
     }
 
