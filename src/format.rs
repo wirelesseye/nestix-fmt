@@ -1223,6 +1223,7 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize) -> String {
     let parts = split_commas(nodes);
     if !has_comments
         && !has_statement_block(nodes)
+        && !parts.iter().any(|part| wrapper_list_items(part).is_some())
         && indent + prefix_len + compact.len() + 2 <= max_width()
     {
         return format!("({compact})");
@@ -1243,6 +1244,19 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize) -> String {
 }
 
 fn format_generic(nodes: &[Node], indent: usize) -> String {
+    if let Some(items) = wrapper_list_items(nodes) {
+        let child_indent = indent + tab_spaces();
+        let mut output = String::from("$wrapper = [\n");
+        for item in items {
+            output.push_str(&spaces(child_indent));
+            output.push_str(&format_generic(item, child_indent));
+            output.push_str(",\n");
+        }
+        output.push_str(&spaces(indent));
+        output.push(']');
+        return output;
+    }
+
     let compact = inline(nodes);
     if USE_RUSTFMT.get()
         && !contains_comments(nodes)
@@ -1355,6 +1369,31 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
         index += 1;
     }
     output
+}
+
+fn wrapper_list_items(nodes: &[Node]) -> Option<Vec<&[Node]>> {
+    let [
+        Node::Token(dollar),
+        Node::Token(name),
+        Node::Token(equals),
+        Node::Group {
+            open: '[',
+            close: ']',
+            nodes: wrappers,
+        },
+    ] = nodes
+    else {
+        return None;
+    };
+    if dollar != "$" || name != "wrapper" || equals != "=" {
+        return None;
+    }
+
+    let items: Vec<_> = split_commas(wrappers)
+        .into_iter()
+        .filter(|item| !item.is_empty())
+        .collect();
+    (items.len() > 1).then_some(items)
 }
 
 fn format_format_macro(nodes: &[Node], indent: usize) -> String {
@@ -1878,6 +1917,24 @@ mod tests {
         let input =
             r#"layout! { Root { Widget(.value=value.clone(),$if=show.get()){Child} } }"#;
         let expected = "layout! {\n    Root {\n        Widget(.value = value.clone(), $if = show.get()) {\n            Child\n        }\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_single_layout_wrapper_inline() {
+        let input = "layout! { FlexView($wrapper=ThemeProvider(theme)){Child} }";
+        let expected = "layout! {\n    FlexView($wrapper = ThemeProvider(theme)) {\n        Child\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_multiple_layout_wrappers_as_a_list() {
+        let input = "layout! { FlexView($wrapper=[ThemeProvider(theme),StyleProvider(styles),]){Child} }";
+        let expected = "layout! {\n    FlexView(\n        $wrapper = [\n            ThemeProvider(theme),\n            StyleProvider(styles),\n        ],\n    ) {\n        Child\n    }\n}";
         let formatted = format_dsl(input).unwrap();
         assert_eq!(formatted, expected);
         assert_eq!(format_dsl(&formatted).unwrap(), formatted);
