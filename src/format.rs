@@ -433,7 +433,7 @@ fn is_single_element(nodes: &[Node]) -> bool {
     {
         return false;
     }
-    if format_element(nodes, &mut cursor, 0, yielded).is_err() {
+    if format_element(nodes, &mut cursor, 0, yielded, true).is_err() {
         return false;
     }
     while take(nodes, &mut cursor, ",") {}
@@ -936,7 +936,7 @@ fn format_item(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<Stri
     if !yielded && nodes.get(*cursor).and_then(Node::token) == Some("for") {
         return format_for(nodes, cursor, indent);
     }
-    format_element(nodes, cursor, indent, yielded).map_err(|error| {
+    format_element(nodes, cursor, indent, yielded, true).map_err(|error| {
         format!(
             "could not format layout item beginning with `{}`: {error}",
             inline(&nodes[start..nodes.len().min(start + 4)])
@@ -1035,6 +1035,7 @@ fn format_element(
     cursor: &mut usize,
     indent: usize,
     yielded: bool,
+    trailing_props_comma: bool,
 ) -> Result<String, String> {
     let mut prefix = String::new();
     if yielded {
@@ -1061,10 +1062,20 @@ fn format_element(
             return Err("expected direct props after `$`".into());
         };
         prefix.push('$');
-        prefix.push_str(&format_parens(props, indent, prefix.len()));
+        prefix.push_str(&format_parens(
+            props,
+            indent,
+            prefix.len(),
+            trailing_props_comma,
+        ));
         *cursor += 1;
     } else if let Some(props) = nodes.get(*cursor).and_then(|node| node.group('(')) {
-        prefix.push_str(&format_parens(props, indent, prefix.len()));
+        prefix.push_str(&format_parens(
+            props,
+            indent,
+            prefix.len(),
+            trailing_props_comma,
+        ));
         *cursor += 1;
     }
     collect_postfix_comments(nodes, cursor, &mut interstitial_comments);
@@ -1206,7 +1217,7 @@ fn consume_type(nodes: &[Node], cursor: &mut usize) -> Result<(), String> {
     Ok(())
 }
 
-fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize) -> String {
+fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize, trailing_comma: bool) -> String {
     if nodes.is_empty() {
         return "()".into();
     }
@@ -1220,7 +1231,10 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize) -> String {
             .to_owned();
     }
     let has_comments = contains_comments(nodes);
-    let parts = split_commas(nodes);
+    let parts: Vec<_> = split_commas(nodes)
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect();
     if !has_comments
         && !has_statement_block(nodes)
         && !parts.iter().any(|part| wrapper_list_items(part).is_some())
@@ -1230,13 +1244,14 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize) -> String {
     }
     let child_indent = indent + tab_spaces();
     let mut output = String::from("(\n");
-    for part in parts {
-        if part.is_empty() {
-            continue;
-        }
+    let part_count = parts.len();
+    for (index, part) in parts.into_iter().enumerate() {
         output.push_str(&spaces(child_indent));
         output.push_str(&format_generic(part, child_indent));
-        output.push_str(",\n");
+        if trailing_comma || index + 1 < part_count {
+            output.push(',');
+        }
+        output.push('\n');
     }
     output.push_str(&spaces(indent));
     output.push(')');
@@ -1248,13 +1263,28 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
         let child_indent = indent + tab_spaces();
         let mut output = String::from("$wrapper = [\n");
         for item in items {
-            output.push_str(&spaces(child_indent));
-            output.push_str(&format_generic(item, child_indent));
+            output.push_str(
+                &format_wrapper_element(item, child_indent).unwrap_or_else(|| {
+                    format!(
+                        "{}{}",
+                        spaces(child_indent),
+                        format_generic(item, child_indent)
+                    )
+                }),
+            );
             output.push_str(",\n");
         }
         output.push_str(&spaces(indent));
         output.push(']');
         return output;
+    }
+    if let Some(element) = single_wrapper_element(nodes)
+        && let Some(element) = format_wrapper_element(element, indent)
+    {
+        let element = element
+            .strip_prefix(&spaces(indent))
+            .unwrap_or(element.as_str());
+        return format!("$wrapper = {element}");
     }
 
     let compact = inline(nodes);
@@ -1371,6 +1401,35 @@ fn format_generic(nodes: &[Node], indent: usize) -> String {
     output
 }
 
+fn format_wrapper_element(nodes: &[Node], indent: usize) -> Option<String> {
+    let mut cursor = 0;
+    let output = format_element(nodes, &mut cursor, indent, false, false).ok()?;
+    (cursor == nodes.len()).then_some(output)
+}
+
+fn single_wrapper_element(nodes: &[Node]) -> Option<&[Node]> {
+    let [
+        Node::Token(dollar),
+        Node::Token(name),
+        Node::Token(equals),
+        element @ ..,
+    ] = nodes
+    else {
+        return None;
+    };
+    if dollar != "$"
+        || name != "wrapper"
+        || equals != "="
+        || element.is_empty()
+        || element
+            .first()
+            .is_some_and(|node| node.group('[').is_some())
+    {
+        return None;
+    }
+    Some(element)
+}
+
 fn wrapper_list_items(nodes: &[Node]) -> Option<Vec<&[Node]>> {
     let [
         Node::Token(dollar),
@@ -1421,10 +1480,7 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
         return None;
     }
     let left = &nodes[..=separator];
-    let is_dsl_prefix = matches!(
-        left.first().and_then(Node::token),
-        Some(".") | Some("$")
-    )
+    let is_dsl_prefix = matches!(left.first().and_then(Node::token), Some(".") | Some("$"))
         || left.iter().any(|node| node.token() == Some(":"));
     if !is_dsl_prefix {
         return None;
@@ -1914,8 +1970,7 @@ mod tests {
 
     #[test]
     fn formats_layout_if_directives_with_props() {
-        let input =
-            r#"layout! { Root { Widget(.value=value.clone(),$if=show.get()){Child} } }"#;
+        let input = r#"layout! { Root { Widget(.value=value.clone(),$if=show.get()){Child} } }"#;
         let expected = "layout! {\n    Root {\n        Widget(.value = value.clone(), $if = show.get()) {\n            Child\n        }\n    }\n}";
         let formatted = format_dsl(input).unwrap();
         assert_eq!(formatted, expected);
@@ -1925,7 +1980,8 @@ mod tests {
     #[test]
     fn formats_single_layout_wrapper_inline() {
         let input = "layout! { FlexView($wrapper=ThemeProvider(theme)){Child} }";
-        let expected = "layout! {\n    FlexView($wrapper = ThemeProvider(theme)) {\n        Child\n    }\n}";
+        let expected =
+            "layout! {\n    FlexView($wrapper = ThemeProvider(theme)) {\n        Child\n    }\n}";
         let formatted = format_dsl(input).unwrap();
         assert_eq!(formatted, expected);
         assert_eq!(format_dsl(&formatted).unwrap(), formatted);
@@ -1933,8 +1989,27 @@ mod tests {
 
     #[test]
     fn formats_multiple_layout_wrappers_as_a_list() {
-        let input = "layout! { FlexView($wrapper=[ThemeProvider(theme),StyleProvider(styles),]){Child} }";
+        let input =
+            "layout! { FlexView($wrapper=[ThemeProvider(theme),StyleProvider(styles),]){Child} }";
         let expected = "layout! {\n    FlexView(\n        $wrapper = [\n            ThemeProvider(theme),\n            StyleProvider(styles),\n        ],\n    ) {\n        Child\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_long_wrapper_props_as_an_element() {
+        let input = "layout! { FlexView($wrapper=[StyleScope(.class=props.class.clone(),.default_classes=DEFAULT_CLASSES,.effective_style=None),ContextProvider<TreeContext>(subtree_context.clone()),]){Child} }";
+        let expected = "layout! {\n    FlexView(\n        $wrapper = [\n            StyleScope(\n                .class = props.class.clone(),\n                .default_classes = DEFAULT_CLASSES,\n                .effective_style = None\n            ),\n            ContextProvider<TreeContext>(subtree_context.clone()),\n        ],\n    ) {\n        Child\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_long_single_wrapper_props_as_an_element() {
+        let input = "layout! { FlexView($wrapper=StyleScope(.class=props.class.clone(),.default_classes=DEFAULT_CLASSES,.effective_style=None)){Child} }";
+        let expected = "layout! {\n    FlexView(\n        $wrapper = StyleScope(\n            .class = props.class.clone(),\n            .default_classes = DEFAULT_CLASSES,\n            .effective_style = None\n        ),\n    ) {\n        Child\n    }\n}";
         let formatted = format_dsl(input).unwrap();
         assert_eq!(formatted, expected);
         assert_eq!(format_dsl(&formatted).unwrap(), formatted);
