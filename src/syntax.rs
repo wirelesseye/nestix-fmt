@@ -4,7 +4,7 @@
 
 use proc_macro2::TokenStream;
 use syn::{
-    Expr, FnArg, Ident, Token, Type, braced, bracketed, parenthesized,
+    Expr, FnArg, Ident, Pat, Token, Type, braced, bracketed, parenthesized,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
     token,
@@ -126,6 +126,32 @@ impl Parse for For {
     }
 }
 
+struct Match;
+
+impl Parse for Match {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        input.parse::<Token![match]>()?;
+        Expr::parse_without_eager_brace(input)?;
+        let inner;
+        braced!(inner in input);
+        while !inner.is_empty() {
+            Pat::parse_multi_with_leading_vert(&inner)?;
+            if inner.peek(Token![if]) {
+                inner.parse::<Token![if]>()?;
+                Expr::parse_without_eager_brace(&inner)?;
+            }
+            inner.parse::<Token![=>]>()?;
+            let body;
+            braced!(body in inner);
+            body.parse::<Layout>()?;
+            if inner.peek(Token![,]) {
+                inner.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self)
+    }
+}
+
 pub struct Layout;
 
 impl Parse for Layout {
@@ -143,6 +169,8 @@ impl Parse for Layout {
                 input.parse::<If>()?;
             } else if input.peek(Token![for]) {
                 input.parse::<For>()?;
+            } else if input.peek(Token![match]) {
+                input.parse::<Match>()?;
             } else {
                 input.parse::<Element>()?;
             }

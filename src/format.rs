@@ -429,7 +429,11 @@ fn is_single_element(nodes: &[Node]) -> bool {
         return false;
     }
     if nodes.get(cursor).and_then(Node::token) == Some("$")
-        || (!yielded && matches!(nodes.get(cursor).and_then(Node::token), Some("if" | "for")))
+        || (!yielded
+            && matches!(
+                nodes.get(cursor).and_then(Node::token),
+                Some("if" | "for" | "match")
+            ))
     {
         return false;
     }
@@ -936,6 +940,9 @@ fn format_item(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<Stri
     if !yielded && nodes.get(*cursor).and_then(Node::token) == Some("for") {
         return format_for(nodes, cursor, indent);
     }
+    if !yielded && nodes.get(*cursor).and_then(Node::token) == Some("match") {
+        return format_match(nodes, cursor, indent);
+    }
     format_element(nodes, cursor, indent, yielded, true).map_err(|error| {
         format!(
             "could not format layout item beginning with `{}`: {error}",
@@ -1005,6 +1012,95 @@ fn format_for(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<Strin
         format_layout(body, indent + tab_spaces())?,
         spaces(indent)
     ))
+}
+
+fn format_match(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<String, String> {
+    *cursor += 1;
+    let arms_at = nodes[*cursor..]
+        .iter()
+        .position(|node| node.group('{').is_some())
+        .map(|offset| *cursor + offset)
+        .ok_or("expected arms after `match` expression")?;
+    let expression_nodes = &nodes[*cursor..arms_at];
+    let expression_inline = inline(expression_nodes);
+    let expression = if USE_RUSTFMT.get() && indent + 6 + expression_inline.len() > max_width() {
+        format_rust_expression(&expression_inline, indent + 6, indent)
+            .unwrap_or_else(|| format_generic(expression_nodes, indent + 6))
+    } else {
+        format_generic(expression_nodes, indent + 6)
+    };
+    let arms = nodes[arms_at].group('{').unwrap();
+    *cursor = arms_at + 1;
+
+    Ok(format!(
+        "{}match {expression} {{\n{}\n{}}}",
+        spaces(indent),
+        format_match_arms(arms, indent + tab_spaces())?,
+        spaces(indent)
+    ))
+}
+
+fn format_match_arms(nodes: &[Node], indent: usize) -> Result<String, String> {
+    let mut cursor = 0;
+    let mut arms = Vec::new();
+    while cursor < nodes.len() {
+        while take(nodes, &mut cursor, ",") {}
+        while let Some(Node::Comment(comment)) = nodes.get(cursor) {
+            push_comment(&mut arms, comment, indent);
+            cursor += 1;
+        }
+        if cursor == nodes.len() {
+            break;
+        }
+
+        let arrow = nodes[cursor..]
+            .iter()
+            .position(|node| node.token() == Some("=>"))
+            .map(|offset| cursor + offset)
+            .ok_or("expected `=>` in match arm")?;
+        let body_at = arrow + 1;
+        let Some(body) = nodes.get(body_at).and_then(|node| node.group('{')) else {
+            return Err("expected DSL block after `=>`".into());
+        };
+
+        let header = &nodes[cursor..arrow];
+        let guard_at = header.iter().position(|node| node.token() == Some("if"));
+        let pattern_end = guard_at.unwrap_or(header.len());
+        let pattern = inline_pattern(&header[..pattern_end]);
+        let guard = guard_at.map(|guard_at| {
+            let guard_nodes = &header[guard_at + 1..];
+            let guard_inline = inline(guard_nodes);
+            if USE_RUSTFMT.get() && indent + pattern.len() + guard_inline.len() + 8 > max_width() {
+                format_rust_expression(&guard_inline, indent + tab_spaces(), indent)
+                    .unwrap_or_else(|| format_generic(guard_nodes, indent + tab_spaces()))
+            } else {
+                format_generic(guard_nodes, indent)
+            }
+        });
+        let header = if let Some(guard) = guard {
+            let inline_header = format!("{pattern} if {guard}");
+            if !guard.contains('\n') && indent + inline_header.len() + 6 <= max_width() {
+                inline_header
+            } else {
+                format!("{pattern} if\n{}{}", spaces(indent + tab_spaces()), guard)
+            }
+        } else {
+            pattern
+        };
+        let formatted_body = format_layout(body, indent + tab_spaces())?;
+        if formatted_body.is_empty() {
+            arms.push(format!("{}{header} => {{}},", spaces(indent)));
+        } else {
+            arms.push(format!(
+                "{}{header} => {{\n{formatted_body}\n{}}},",
+                spaces(indent),
+                spaces(indent)
+            ));
+        }
+
+        cursor = body_at + 1;
+    }
+    Ok(arms.join("\n"))
 }
 
 fn format_for_header(nodes: &[Node], indent: usize) -> String {
@@ -1712,6 +1808,37 @@ fn inline(nodes: &[Node]) -> String {
     output
 }
 
+fn inline_pattern(nodes: &[Node]) -> String {
+    let mut output = String::new();
+    for node in nodes {
+        match node {
+            Node::Token(token) if token == "|" => {
+                while output.ends_with(' ') {
+                    output.pop();
+                }
+                if !output.is_empty() {
+                    output.push(' ');
+                }
+                output.push('|');
+                output.push(' ');
+            }
+            Node::Token(token) => append_token(&mut output, token),
+            Node::Comment(comment) => {
+                if !output.is_empty() && !output.ends_with(' ') {
+                    output.push(' ');
+                }
+                output.push_str(comment);
+            }
+            Node::Group { open, close, nodes } => {
+                output.push(*open);
+                output.push_str(&inline_pattern(nodes));
+                output.push(*close);
+            }
+        }
+    }
+    output
+}
+
 fn append_pipe(output: &mut String, closure_pipe: &mut bool) {
     if *closure_pipe {
         while output.ends_with(' ') {
@@ -2198,6 +2325,27 @@ mod tests {
         let formatted = format_default(input).unwrap();
         assert!(formatted.contains("\n        && second_condition"));
         assert!(formatted.contains("load_every_item_from_a_very_long_source_name(\n"));
+        assert!(formatted.lines().all(|line| line.len() <= WIDTH));
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_match_arms_as_layout_blocks() {
+        let input = "layout! { match value { Some(item) if item.ready => { Ready(.item=item) } None | Some(_) => { Empty Another } _ => {} } }";
+        let expected = "layout! {\n    match value {\n        Some(item) if item.ready => {\n            Ready(.item = item)\n        },\n        None | Some(_) => {\n            Empty\n            Another\n        },\n        _ => {},\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn wraps_long_match_expressions_and_preserves_arm_comments() {
+        let input = r#"layout! { match load_the_current_application_state_with_a_very_long_name(first_argument_with_a_long_name, second_argument_with_a_long_name, third_argument_with_a_long_name) { // ready
+ Some(item) if item_is_ready_after_checking_every_required_condition_with_a_long_name(item) => { Ready(.item = item) } _ => { Empty } } }"#;
+        let formatted = format_default(input).unwrap();
+        assert!(formatted.contains("load_the_current_application_state_with_a_very_long_name(\n"));
+        assert!(formatted.contains("// ready"));
+        assert!(formatted.contains("Some(item) if"));
         assert!(formatted.lines().all(|line| line.len() <= WIDTH));
         assert_eq!(format_default(&formatted).unwrap(), formatted);
     }
