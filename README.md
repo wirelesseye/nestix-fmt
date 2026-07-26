@@ -2,6 +2,14 @@
 
 `nestix-fmt` formats the Nestix DSL inside Rust `layout!` macro invocations.
 
+## Installation
+
+```console
+cargo install --git https://github.com/wirelesseye/nestix-fmt.git
+```
+
+## Usage
+
 ```console
 # Rewrite Rust files under a directory.
 nestix-fmt src

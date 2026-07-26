@@ -62,11 +62,11 @@ fn run(args: Args) -> Result<ExitCode, String> {
             .map_err(|error| format!("failed to read stdin: {error}"))?;
         let formatted = format::format_source(&source, None, !args.no_rustfmt)?;
         if args.check {
-            return Ok(if source == formatted {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            });
+            if source == formatted {
+                return Ok(ExitCode::SUCCESS);
+            }
+            print_diff("<stdin>", &source, &formatted);
+            return Ok(ExitCode::from(1));
         }
         print!("{formatted}");
         return Ok(ExitCode::SUCCESS);
@@ -97,7 +97,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
     let formatted = format::format_files(&sources, !args.no_rustfmt);
     for ((path, source), result) in sources.into_iter().zip(formatted) {
         match result {
-            Ok(formatted) if formatted != source => pending.push((path, formatted)),
+            Ok(formatted) if formatted != source => pending.push((path, source, formatted)),
             Ok(_) => {}
             Err(error) => {
                 eprintln!("{error}");
@@ -110,8 +110,8 @@ fn run(args: Args) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     }
     if args.check {
-        for (path, _) in &pending {
-            println!("{}", path.display());
+        for (path, source, formatted) in &pending {
+            print_diff(&path.display().to_string(), source, formatted);
         }
         return Ok(if pending.is_empty() {
             ExitCode::SUCCESS
@@ -119,11 +119,93 @@ fn run(args: Args) -> Result<ExitCode, String> {
             ExitCode::from(1)
         });
     }
-    for (path, formatted) in pending {
+    for (path, _, formatted) in pending {
         fs::write(&path, formatted)
             .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Clone, Copy)]
+enum DiffLine<'a> {
+    Same(&'a str),
+    Removed(&'a str),
+    Added(&'a str),
+}
+
+fn print_diff(name: &str, original: &str, formatted: &str) {
+    let original_has_newline = original.ends_with('\n');
+    let formatted_has_newline = formatted.ends_with('\n');
+    let original: Vec<_> = original.lines().collect();
+    let formatted: Vec<_> = formatted.lines().collect();
+    let mut lines = diff_lines(&original, &formatted);
+    if !original_has_newline && formatted_has_newline {
+        lines.push(DiffLine::Added(""));
+    } else if original_has_newline && !formatted_has_newline {
+        lines.push(DiffLine::Removed(""));
+    }
+
+    let changes: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (!matches!(line, DiffLine::Same(_))).then_some(index))
+        .collect();
+    let mut change = 0;
+    while change < changes.len() {
+        let start = changes[change].saturating_sub(3);
+        let mut last_change = changes[change];
+        change += 1;
+        while change < changes.len() && changes[change] <= last_change + 6 {
+            last_change = changes[change];
+            change += 1;
+        }
+        let end = (last_change + 4).min(lines.len());
+        let old_line = 1 + lines[..start]
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Added(_)))
+            .count();
+        println!("Diff in {name}:{old_line}:");
+        for line in &lines[start..end] {
+            match line {
+                DiffLine::Same(line) => println!(" {line}"),
+                DiffLine::Removed(line) => println!("-{line}"),
+                DiffLine::Added(line) => println!("+{line}"),
+            }
+        }
+        println!(" ");
+    }
+}
+
+fn diff_lines<'a>(original: &[&'a str], formatted: &[&'a str]) -> Vec<DiffLine<'a>> {
+    let mut lengths = vec![vec![0usize; formatted.len() + 1]; original.len() + 1];
+    for old in (0..original.len()).rev() {
+        for new in (0..formatted.len()).rev() {
+            lengths[old][new] = if original[old] == formatted[new] {
+                lengths[old + 1][new + 1] + 1
+            } else {
+                lengths[old + 1][new].max(lengths[old][new + 1])
+            };
+        }
+    }
+
+    let (mut old, mut new) = (0, 0);
+    let mut lines = Vec::new();
+    while old < original.len() || new < formatted.len() {
+        if old < original.len() && new < formatted.len() && original[old] == formatted[new] {
+            lines.push(DiffLine::Same(original[old]));
+            old += 1;
+            new += 1;
+        } else if old < original.len()
+            && (new == formatted.len() || lengths[old + 1][new] >= lengths[old][new + 1])
+        {
+            lines.push(DiffLine::Removed(original[old]));
+            old += 1;
+        } else {
+            lines.push(DiffLine::Added(formatted[new]));
+            new += 1;
+        }
+    }
+    lines
 }
 
 fn cargo_package_roots(args: &Args) -> Result<Vec<PathBuf>, String> {
