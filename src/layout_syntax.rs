@@ -1,4 +1,4 @@
-//! The formatter deliberately owns this small syntax model.  A proc-macro
+//! The formatter deliberately owns this small layout syntax model. A proc-macro
 //! crate cannot export its parser, and keeping this copy here leaves the
 //! formatter usable without linking Nestix itself.
 

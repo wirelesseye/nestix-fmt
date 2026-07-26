@@ -1,5 +1,7 @@
-mod format;
-mod syntax;
+mod layout_format;
+mod layout_syntax;
+mod style_format;
+mod style_syntax;
 
 use std::{
     collections::BTreeSet,
@@ -19,7 +21,7 @@ struct Args {
     #[arg(long)]
     check: bool,
 
-    /// Disable rustfmt for both the complete source and Rust inside layout DSL.
+    /// Disable rustfmt for both the complete source and Rust inside Nestix DSLs.
     #[arg(long)]
     no_rustfmt: bool,
 
@@ -52,7 +54,7 @@ fn main() -> ExitCode {
 
 fn run(args: Args) -> Result<ExitCode, String> {
     if !args.no_rustfmt {
-        format::ensure_rustfmt()?;
+        layout_format::ensure_rustfmt()?;
     }
     let cargo_mode = !args.packages.is_empty() || args.manifest_path.is_some() || args.all;
     if args.paths.is_empty() && !cargo_mode {
@@ -60,7 +62,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
         io::stdin()
             .read_to_string(&mut source)
             .map_err(|error| format!("failed to read stdin: {error}"))?;
-        let formatted = format::format_source(&source, None, !args.no_rustfmt)?;
+        let formatted = layout_format::format_source(&source, None, !args.no_rustfmt)?;
         if args.check {
             if source == formatted {
                 return Ok(ExitCode::SUCCESS);
@@ -94,7 +96,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
         sources.push((path, source));
     }
 
-    let formatted = format::format_files(&sources, !args.no_rustfmt);
+    let formatted = layout_format::format_files(&sources, !args.no_rustfmt);
     for ((path, source), result) in sources.into_iter().zip(formatted) {
         match result {
             Ok(formatted) if formatted != source => pending.push((path, source, formatted)),

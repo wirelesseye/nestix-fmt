@@ -2,7 +2,7 @@
 name = "nestix-fmt"
 version = "0.1.0"
 edition = "2024"
-description = "Formatter for the DSL embedded in Nestix layout! macros"
+description = "Formatter for the DSLs embedded in Nestix macros"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

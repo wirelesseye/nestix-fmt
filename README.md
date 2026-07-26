@@ -1,6 +1,7 @@
 # nestix-fmt
 
-`nestix-fmt` formats the Nestix DSL inside Rust `layout!` macro invocations.
+`nestix-fmt` formats the Nestix DSLs inside Rust `layout!`, `style!`, and
+`computed_style!` macro invocations.
 
 ## Installation
 
@@ -23,7 +24,7 @@ nestix-fmt --package nestix
 nestix-fmt --manifest-path path/to/Cargo.toml
 nestix-fmt --all
 
-# Format the layout DSL without invoking rustfmt.
+# Format the Nestix DSLs without invoking rustfmt.
 nestix-fmt --no-rustfmt src
 
 # Use it as a stdin/stdout filter.
@@ -39,6 +40,6 @@ uses `rustfmt` for ordinary Rust expressions embedded in the DSL.
 file's directory, so files under nested configurations are formatted with their
 nearest settings. Stdin uses the current working directory. Rustfmt settings
 apply to the Rust source, while `max_width`, `tab_spaces`, and `hard_tabs` also
-control wrapping and indentation inside `layout!`. Without a configuration,
+control wrapping and indentation inside the Nestix macros. Without a configuration,
 the DSL defaults to four-space indentation and 100 columns. `--no-rustfmt`
 does not read rustfmt configuration and always uses those defaults.

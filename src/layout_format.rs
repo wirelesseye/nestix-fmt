@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use crate::syntax;
+use crate::layout_syntax;
 
 const WIDTH: usize = 100;
 const TAB_SPACES: usize = 4;
@@ -95,7 +95,7 @@ pub fn ensure_rustfmt() -> Result<(), String> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Node {
+pub(crate) enum Node {
     Token(String),
     Comment(String),
     Group {
@@ -106,14 +106,14 @@ enum Node {
 }
 
 impl Node {
-    fn token(&self) -> Option<&str> {
+    pub(crate) fn token(&self) -> Option<&str> {
         match self {
             Self::Token(token) => Some(token),
             _ => None,
         }
     }
 
-    fn group(&self, open: char) -> Option<&[Node]> {
+    pub(crate) fn group(&self, open: char) -> Option<&[Node]> {
         match self {
             Self::Group {
                 open: actual,
@@ -144,7 +144,7 @@ pub fn format_source(
     } else {
         source
     };
-    format_layouts_in_source(&source, path).map(|formatted| line_ending.apply(&formatted))
+    format_macros_in_source(&source, path).map(|formatted| line_ending.apply(&formatted))
 }
 
 /// Formats files in a batch so the ordinary Rust pass only starts rustfmt once
@@ -228,7 +228,7 @@ fn format_layout_files(
                         let line_ending = config.newline_style.resolve(original);
                         USE_RUSTFMT.set(true);
                         FORMATTER_CONFIG.set(config.clone());
-                        let result = format_layouts_in_source(rust_source, Some(path))
+                        let result = format_macros_in_source(rust_source, Some(path))
                             .map(|formatted| line_ending.apply(&formatted));
                         results.push((*index, result));
                     }
@@ -352,11 +352,11 @@ fn normalize_newlines(source: &str) -> String {
     source.replace("\r\n", "\n")
 }
 
-fn max_width() -> usize {
+pub(crate) fn max_width() -> usize {
     FORMATTER_CONFIG.with(|config| config.borrow().max_width)
 }
 
-fn tab_spaces() -> usize {
+pub(crate) fn tab_spaces() -> usize {
     FORMATTER_CONFIG.with(|config| config.borrow().tab_spaces)
 }
 
@@ -364,9 +364,9 @@ fn rustfmt_config_dir() -> Option<PathBuf> {
     FORMATTER_CONFIG.with(|config| config.borrow().rustfmt_config_dir.clone())
 }
 
-fn format_layouts_in_source(source: &str, path: Option<&Path>) -> Result<String, String> {
+fn format_macros_in_source(source: &str, path: Option<&Path>) -> Result<String, String> {
     let invocations =
-        find_layouts(source).map_err(|error| diagnostic(path, source, error.0, &error.1))?;
+        find_macros(source).map_err(|error| diagnostic(path, source, error.0, &error.1))?;
     if invocations.is_empty() {
         return Ok(source.to_owned());
     }
@@ -376,33 +376,39 @@ fn format_layouts_in_source(source: &str, path: Option<&Path>) -> Result<String,
     for invocation in invocations {
         output.push_str(&source[cursor..invocation.body_start]);
         let body = &source[invocation.body_start..invocation.body_end];
-        let nested = format_layouts_in_source(body, path)?;
-        syntax::validate(&nested).map_err(|error| {
+        let nested = format_macros_in_source(body, path)?;
+        invocation.kind.validate(&nested).map_err(|error| {
             let location = error.span().start();
             let relative = offset_at(&nested, location.line, location.column);
             diagnostic(
                 path,
                 source,
                 invocation.body_start + relative,
-                &format!("invalid layout syntax: {error}"),
+                &format!("invalid {} syntax: {error}", invocation.kind.name()),
             )
         })?;
         let nodes = lex_nodes(&nested)
             .map_err(|error| diagnostic(path, source, invocation.body_start + error.0, &error.1))?;
         let base = line_indent(source, invocation.open_offset);
-        let formatted = format_layout(&nodes, base + tab_spaces())
+        let formatted = invocation
+            .kind
+            .format(&nodes, base + tab_spaces())
             .map_err(|error| diagnostic(path, source, invocation.body_start, &error))?;
-        syntax::validate(&formatted).map_err(|error| {
+        invocation.kind.validate(&formatted).map_err(|error| {
             diagnostic(
                 path,
                 source,
                 invocation.body_start,
-                &format!("formatter produced invalid layout syntax: {error}"),
+                &format!(
+                    "formatter produced invalid {} syntax: {error}",
+                    invocation.kind.name()
+                ),
             )
         })?;
         if nodes.is_empty() {
             // An empty layout has no useful internal shape to preserve.
-        } else if !body.contains('\n')
+        } else if invocation.kind == MacroKind::Layout
+            && !body.contains('\n')
             && is_single_element(&nodes)
             && !formatted.contains('\n')
             && base + formatted.trim().len() + "layout! {  }".len() <= max_width()
@@ -549,12 +555,55 @@ fn rustfmt_sources(sources: &[String], config_dir: Option<&Path>) -> Result<Vec<
 
 #[derive(Clone, Copy)]
 struct Invocation {
+    kind: MacroKind,
     open_offset: usize,
     body_start: usize,
     body_end: usize,
 }
 
-fn find_layouts(source: &str) -> Result<Vec<Invocation>, (usize, String)> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacroKind {
+    Layout,
+    Style,
+    ComputedStyle,
+}
+
+impl MacroKind {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "layout" => Some(Self::Layout),
+            "style" => Some(Self::Style),
+            "computed_style" => Some(Self::ComputedStyle),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Layout => "layout",
+            Self::Style => "style",
+            Self::ComputedStyle => "computed_style",
+        }
+    }
+
+    fn validate(self, source: &str) -> syn::Result<()> {
+        match self {
+            Self::Layout => layout_syntax::validate(source),
+            Self::Style => crate::style_syntax::validate(source, false),
+            Self::ComputedStyle => crate::style_syntax::validate(source, true),
+        }
+    }
+
+    fn format(self, nodes: &[Node], indent: usize) -> Result<String, String> {
+        match self {
+            Self::Layout => format_layout(nodes, indent),
+            Self::Style => crate::style_format::format(nodes, indent, false),
+            Self::ComputedStyle => crate::style_format::format(nodes, indent, true),
+        }
+    }
+}
+
+fn find_macros(source: &str) -> Result<Vec<Invocation>, (usize, String)> {
     let bytes = source.as_bytes();
     let mut found = Vec::new();
     let mut index = 0;
@@ -587,9 +636,9 @@ fn find_layouts(source: &str) -> Result<Vec<Invocation>, (usize, String)> {
                 }
                 continue;
             }
-            if name != "layout" {
+            let Some(kind) = MacroKind::from_name(name) else {
                 continue;
-            }
+            };
             let mut look = skip_space(source, index);
             if bytes.get(look) != Some(&b'!') {
                 continue;
@@ -606,6 +655,7 @@ fn find_layouts(source: &str) -> Result<Vec<Invocation>, (usize, String)> {
             };
             let body_end = matching_delimiter(source, look, open_byte, close)?;
             found.push(Invocation {
+                kind,
                 open_offset: look,
                 body_start: look + 1,
                 body_end,
@@ -643,7 +693,7 @@ fn matching_delimiter(
                 }
             }
             byte if byte == b'}' || byte == b')' || byte == b']' => {
-                return Err((index, "mismatched delimiter in layout macro".into()));
+                return Err((index, "mismatched delimiter in Nestix macro".into()));
             }
             _ => {}
         }
@@ -651,7 +701,7 @@ fn matching_delimiter(
     }
     Err((
         open_at,
-        format!("unclosed `{}` delimiter in layout macro", open as char),
+        format!("unclosed `{}` delimiter in Nestix macro", open as char),
     ))
 }
 
@@ -757,7 +807,7 @@ fn char_len(source: &str, index: usize) -> usize {
     source[index..].chars().next().map_or(1, char::len_utf8)
 }
 
-fn is_ident_start(byte: u8) -> bool {
+pub(crate) fn is_ident_start(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphabetic() || byte >= 0x80
 }
 
@@ -1354,7 +1404,7 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize, trailing_comm
     output
 }
 
-fn format_generic(nodes: &[Node], indent: usize) -> String {
+pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
     if let Some(items) = wrapper_list_items(nodes) {
         let child_indent = indent + tab_spaces();
         let mut output = String::from("$wrapper = [\n");
@@ -1774,7 +1824,7 @@ fn format_rust_statement(statement: &str, indent: usize) -> Option<String> {
     Some(formatted)
 }
 
-fn inline(nodes: &[Node]) -> String {
+pub(crate) fn inline(nodes: &[Node]) -> String {
     let mut output = String::new();
     let mut closure_pipe = false;
     for node in nodes {
@@ -1992,7 +2042,7 @@ fn contains_comments(nodes: &[Node]) -> bool {
     })
 }
 
-fn split_commas(nodes: &[Node]) -> Vec<&[Node]> {
+pub(crate) fn split_commas(nodes: &[Node]) -> Vec<&[Node]> {
     let mut parts = Vec::new();
     let mut start = 0;
     for (index, node) in nodes.iter().enumerate() {
@@ -2022,7 +2072,7 @@ fn take(nodes: &[Node], cursor: &mut usize, expected: &str) -> bool {
     }
 }
 
-fn spaces(count: usize) -> String {
+pub(crate) fn spaces(count: usize) -> String {
     FORMATTER_CONFIG.with(|config| {
         let config = config.borrow();
         if !config.hard_tabs {
