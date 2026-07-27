@@ -1405,6 +1405,9 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize, trailing_comm
 }
 
 pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
+    if let Some(nested_prop) = format_nested_prop(nodes, indent) {
+        return nested_prop;
+    }
     if let Some(items) = wrapper_list_items(nodes) {
         let child_indent = indent + tab_spaces();
         let mut output = String::from("$wrapper = [\n");
@@ -1545,6 +1548,30 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
         index += 1;
     }
     output
+}
+
+fn format_nested_prop(nodes: &[Node], indent: usize) -> Option<String> {
+    let [
+        Node::Token(dot),
+        Node::Token(name),
+        Node::Group {
+            open: '(',
+            nodes: props,
+            ..
+        },
+    ] = nodes
+    else {
+        return None;
+    };
+    if dot != "." {
+        return None;
+    }
+
+    let prefix = format!(".{name}");
+    Some(format!(
+        "{prefix}{}",
+        format_parens(props, indent, prefix.len(), false)
+    ))
 }
 
 fn format_wrapper_element(nodes: &[Node], indent: usize) -> Option<String> {
@@ -2142,6 +2169,35 @@ mod tests {
                 "    .second_property_with_a_long_name = second_value_with_a_long_name,\n"
             )
         );
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_nested_props_recursively() {
+        let input = r#"layout! {
+    Window(
+        .title = "Nestix Context Menu",
+        .desktop(.width = 520,
+        .height = 360,
+        .on_close_requested = callback!(|| {
+            unmount_root().expect("root should be mounted");
+        })),
+    )
+}"#;
+        let expected = r#"layout! {
+    Window(
+        .title = "Nestix Context Menu",
+        .desktop(
+            .width = 520,
+            .height = 360,
+            .on_close_requested = callback!(|| {
+                unmount_root().expect("root should be mounted");
+            })
+        ),
+    )
+}"#;
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
         assert_eq!(format_dsl(&formatted).unwrap(), formatted);
     }
 
