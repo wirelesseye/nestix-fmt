@@ -102,6 +102,7 @@ pub(crate) enum Node {
         open: char,
         close: char,
         nodes: Vec<Node>,
+        original: String,
     },
 }
 
@@ -902,11 +903,14 @@ fn lex_until(
             _ => None,
         } {
             *index += 1;
+            let inner_start = *index;
             let inner = lex_until(source, index, Some(close))?;
+            let inner_end = *index - close.len_utf8();
             nodes.push(Node::Group {
                 open: current,
                 close,
                 nodes: inner,
+                original: source[inner_start..inner_end].to_owned(),
             });
             continue;
         }
@@ -1367,7 +1371,20 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize, trailing_comm
     if nodes.is_empty() {
         return "()".into();
     }
-    let mut compact = inline(nodes);
+    let has_comments = contains_comments(nodes);
+    let parts: Vec<_> = split_commas(nodes)
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect();
+    let mut compact = if has_macro_call(nodes, &['(', '[', '{']) {
+        parts
+            .iter()
+            .map(|part| format_generic(part, indent + prefix_len + 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        inline(nodes)
+    };
     if nodes.last().and_then(Node::token) == Some(",") {
         compact = compact
             .trim_end()
@@ -1376,14 +1393,10 @@ fn format_parens(nodes: &[Node], indent: usize, prefix_len: usize, trailing_comm
             .trim_end()
             .to_owned();
     }
-    let has_comments = contains_comments(nodes);
-    let parts: Vec<_> = split_commas(nodes)
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect();
     if !has_comments
         && !has_statement_block(nodes)
         && !parts.iter().any(|part| wrapper_list_items(part).is_some())
+        && !compact.contains('\n')
         && indent + prefix_len + compact.len() + 2 <= max_width()
     {
         return format!("({compact})");
@@ -1441,6 +1454,8 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
         && !contains_comments(nodes)
         && !has_statement_block(nodes)
         && !has_nested_layout(nodes)
+        && !has_macro_call(nodes, &['(', '['])
+        && !has_unformatted_brace_macro(nodes)
         && indent + compact.len() <= max_width()
     {
         return compact;
@@ -1448,6 +1463,7 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
     if USE_RUSTFMT.get()
         && !contains_comments(nodes)
         && !has_nested_layout(nodes)
+        && !has_unformatted_brace_macro(nodes)
         && let Some(formatted) = format_rust_expression(&compact, indent, indent)
         && fits_width(&formatted, indent)
     {
@@ -1471,9 +1487,15 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
     let mut closure_pipe = false;
     let mut index = 0;
     while index < nodes.len() {
-        if nodes[index].token() == Some("format")
+        if USE_RUSTFMT.get()
+            && let Some(macro_name) = nodes[index].token()
             && nodes.get(index + 1).and_then(Node::token) == Some("!")
-            && let Some(arguments) = nodes.get(index + 2).and_then(|node| node.group('('))
+            && let Some(Node::Group {
+                open: open @ ('(' | '['),
+                close,
+                original,
+                ..
+            }) = nodes.get(index + 2)
         {
             let current_column = if let Some(line) = output.rsplit('\n').next() {
                 if output.contains('\n') {
@@ -1484,7 +1506,14 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
             } else {
                 indent
             };
-            output.push_str(&format_format_macro(arguments, current_column));
+            output.push_str(&format_macro_call(
+                macro_name,
+                *open,
+                *close,
+                original,
+                current_column,
+                indent,
+            ));
             index += 3;
             continue;
         }
@@ -1494,6 +1523,7 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
                 open,
                 close,
                 nodes: body,
+                ..
             }) = nodes.get(index + 2)
         {
             append_token(&mut output, "layout");
@@ -1514,6 +1544,23 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
             index += 3;
             continue;
         }
+        if let Some(macro_name) = nodes[index].token()
+            && nodes.get(index + 1).and_then(Node::token) == Some("!")
+            && let Some(Node::Group {
+                open: '{',
+                original,
+                ..
+            }) = nodes.get(index + 2)
+        {
+            append_token(&mut output, macro_name);
+            append_token(&mut output, "!");
+            output.push(' ');
+            output.push('{');
+            output.push_str(original);
+            output.push('}');
+            index += 3;
+            continue;
+        }
         let node = &nodes[index];
         match node {
             Node::Comment(comment) => {
@@ -1526,7 +1573,9 @@ pub(crate) fn format_generic(nodes: &[Node], indent: usize) -> String {
                     output.push_str(&spaces(indent));
                 }
             }
-            Node::Group { open, close, nodes } => {
+            Node::Group {
+                open, close, nodes, ..
+            } => {
                 if *open == '{' && (has_top_level_statement(nodes) || has_statement_block(nodes)) {
                     while output.ends_with(' ') {
                         output.pop();
@@ -1612,6 +1661,7 @@ fn wrapper_list_items(nodes: &[Node]) -> Option<Vec<&[Node]>> {
             open: '[',
             close: ']',
             nodes: wrappers,
+            ..
         },
     ] = nodes
     else {
@@ -1628,21 +1678,16 @@ fn wrapper_list_items(nodes: &[Node]) -> Option<Vec<&[Node]>> {
     (items.len() > 1).then_some(items)
 }
 
-fn format_format_macro(nodes: &[Node], indent: usize) -> String {
-    let child_indent = indent + tab_spaces();
-    let parts = split_commas(nodes);
-    if parts.len() <= 1 && indent + inline(nodes).len() + 9 <= max_width() {
-        return format!("format!({})", inline(nodes));
-    }
-    let mut output = String::from("format!(\n");
-    for part in parts.into_iter().filter(|part| !part.is_empty()) {
-        output.push_str(&spaces(child_indent));
-        output.push_str(&format_generic(part, child_indent));
-        output.push_str(",\n");
-    }
-    output.push_str(&spaces(indent));
-    output.push(')');
-    output
+fn format_macro_call(
+    macro_name: &str,
+    open: char,
+    close: char,
+    original: &str,
+    start_column: usize,
+    continuation_indent: usize,
+) -> String {
+    let expression = format!("{macro_name}!{open}{original}{close}");
+    format_rust_expression(&expression, start_column, continuation_indent).unwrap_or(expression)
 }
 
 fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
@@ -1662,7 +1707,9 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
     let left = left.trim_end();
     let expression_nodes = &nodes[separator + 1..];
     let expression = inline(expression_nodes);
-    if let Some(formatted) = format_rust_expression(&expression, indent + left.len() + 1, indent)
+    if !has_unformatted_brace_macro(expression_nodes)
+        && let Some(formatted) =
+            format_rust_expression(&expression, indent + left.len() + 1, indent)
         && fits_width(&format!("{left} {formatted}"), indent)
     {
         return Some(format!("{left} {formatted}"));
@@ -1675,6 +1722,7 @@ fn format_dsl_assignment(nodes: &[Node], indent: usize) -> Option<String> {
             open: '(',
             close: ')',
             nodes: arguments,
+            ..
         },
     ] = expression_nodes
     else {
@@ -1866,7 +1914,9 @@ pub(crate) fn inline(nodes: &[Node]) -> String {
                 }
                 output.push_str(comment);
             }
-            Node::Group { open, close, nodes } => {
+            Node::Group {
+                open, close, nodes, ..
+            } => {
                 if needs_space_before_group(&output) && *open == '{' {
                     output.push(' ');
                 }
@@ -1906,7 +1956,9 @@ fn inline_pattern(nodes: &[Node]) -> String {
                 }
                 output.push_str(comment);
             }
-            Node::Group { open, close, nodes } => {
+            Node::Group {
+                open, close, nodes, ..
+            } => {
                 output.push(*open);
                 output.push_str(&inline_pattern(nodes));
                 output.push(*close);
@@ -2018,6 +2070,31 @@ fn has_nested_layout(nodes: &[Node]) -> bool {
     })
 }
 
+fn has_macro_call(nodes: &[Node], delimiters: &[char]) -> bool {
+    nodes.windows(3).any(|window| {
+        window[0].token().is_some()
+            && window[1].token() == Some("!")
+            && matches!(
+                &window[2],
+                Node::Group { open, .. } if delimiters.contains(open)
+            )
+    }) || nodes.iter().any(|node| match node {
+        Node::Group { nodes, .. } => has_macro_call(nodes, delimiters),
+        _ => false,
+    })
+}
+
+fn has_unformatted_brace_macro(nodes: &[Node]) -> bool {
+    nodes.windows(3).any(|window| {
+        window[0].token().is_some_and(|name| name != "layout")
+            && window[1].token() == Some("!")
+            && matches!(&window[2], Node::Group { open: '{', .. })
+    }) || nodes.iter().any(|node| match node {
+        Node::Group { nodes, .. } => has_unformatted_brace_macro(nodes),
+        _ => false,
+    })
+}
+
 fn has_top_level_statement(nodes: &[Node]) -> bool {
     contains_comments(nodes) || nodes.iter().any(|node| node.token() == Some(";"))
 }
@@ -2113,7 +2190,7 @@ pub(crate) fn spaces(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WIDTH, format_source};
+    use super::{WIDTH, format_macro_call, format_source};
 
     fn format_dsl(source: &str) -> Result<String, String> {
         format_source(source, None, false)
@@ -2344,6 +2421,57 @@ mod tests {
         assert!(formatted.contains("first_argument_with_a_long_name,"));
         assert!(formatted.lines().all(|line| line.len() <= WIDTH));
         assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn rustfmt_formats_parenthesized_and_bracketed_macro_calls() {
+        let arguments = "first_argument_with_a_long_name, second_argument_with_a_long_name, third_argument_with_a_long_name";
+        for (open, close) in [('(', ')'), ('[', ']')] {
+            let formatted = format_macro_call("custom_macro", open, close, arguments, 8, 8);
+            assert!(formatted.starts_with(&format!("custom_macro!{open}\n")));
+            assert!(formatted.contains("first_argument_with_a_long_name,"));
+            assert!(formatted.ends_with(close));
+            assert!(formatted.lines().all(|line| line.len() + 8 <= WIDTH));
+        }
+        let formatted = format_macro_call("custom_macro", '(', ')', arguments, 40, 8);
+        assert!(formatted.contains("\n            first_argument_with_a_long_name,"));
+
+        let input = "layout! { Widget(.first = custom_macro!(  first,second  ), .second = custom_macro![  first,second  ]) }";
+        let formatted = format_default(input).unwrap();
+        assert!(formatted.contains("custom_macro!(first, second)"));
+        assert!(formatted.contains("custom_macro![first, second]"));
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn rustfmt_does_not_expand_brace_delimited_macro_calls() {
+        let body = "  first,  second,   third  ";
+        let input = format!("layout! {{ Widget(.value = custom_macro! {{{body}}}) }}");
+        let formatted = format_default(&input).unwrap();
+        assert!(
+            formatted.contains(&format!("custom_macro! {{{body}}}")),
+            "{formatted}"
+        );
+        assert!(!formatted.contains("custom_macro! {\n"));
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn preserves_a_qualified_macro_when_rustfmt_cannot_format_its_tokens() {
+        let input = r#"fn view() { layout! { Root { Window { DomElement(.properties = nestix::computed!([value] || vec![DomProperty::new("value", value.get()), ])) } } } }"#;
+        let expected = r#"                    .properties = nestix::computed!([value] || vec![DomProperty::new("value", value.get()), ]),"#;
+        let formatted = format_default(input).unwrap();
+        assert!(formatted.contains(expected), "{formatted}");
+        assert_eq!(format_default(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn failed_macro_rustfmt_preserves_original_whitespace() {
+        let original = "  first   =>\n        second  ";
+        assert_eq!(
+            format_macro_call("if", '(', ')', original, 8, 8),
+            format!("if!({original})")
+        );
     }
 
     #[test]
