@@ -1570,7 +1570,7 @@ fn format_nested_prop(nodes: &[Node], indent: usize) -> Option<String> {
     let prefix = format!(".{name}");
     Some(format!(
         "{prefix}{}",
-        format_parens(props, indent, prefix.len(), false)
+        format_parens(props, indent, prefix.len(), true)
     ))
 }
 
@@ -2192,7 +2192,7 @@ mod tests {
             .height = 360,
             .on_close_requested = callback!(|| {
                 unmount_root().expect("root should be mounted");
-            })
+            }),
         ),
     )
 }"#;
