@@ -4,7 +4,7 @@
 
 use proc_macro2::TokenStream;
 use syn::{
-    Expr, FnArg, Ident, Pat, Token, Type, braced, bracketed, parenthesized,
+    Attribute, Expr, FnArg, Ident, Pat, Token, Type, braced, bracketed, parenthesized,
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
     token,
@@ -35,6 +35,7 @@ struct Element;
 
 impl Parse for Element {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        input.call(Attribute::parse_outer)?;
         if input.peek(Token![yield]) {
             input.parse::<Token![yield]>()?;
         }

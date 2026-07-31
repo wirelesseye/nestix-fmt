@@ -972,6 +972,23 @@ fn format_layout(nodes: &[Node], indent: usize) -> Result<String, String> {
 }
 
 fn format_item(nodes: &[Node], cursor: &mut usize, indent: usize) -> Result<String, String> {
+    if nodes.get(*cursor).and_then(Node::token) == Some("#") {
+        let mut attributes = Vec::new();
+        while nodes.get(*cursor).and_then(Node::token) == Some("#") {
+            let Some(attribute) = nodes.get(*cursor + 1).and_then(|node| node.group('[')) else {
+                return Err("expected bracketed attribute after `#`".into());
+            };
+            attributes.push(format!(
+                "{}#[{}]",
+                spaces(indent),
+                format_generic(attribute, indent + 2)
+            ));
+            *cursor += 2;
+        }
+        attributes.push(format_item(nodes, cursor, indent)?);
+        return Ok(attributes.join("\n"));
+    }
+
     let start = *cursor;
     let yielded = take(nodes, cursor, "yield");
     if nodes.get(*cursor).and_then(Node::token) == Some("$") {
@@ -2567,6 +2584,15 @@ mod tests {
     fn formats_match_arms_as_layout_blocks() {
         let input = "layout! { match value { Some(item) if item.ready => { Ready(.item=item) } None | Some(_) => { Empty Another } _ => {} } }";
         let expected = "layout! {\n    match value {\n        Some(item) if item.ready => {\n            Ready(.item = item)\n        },\n        None | Some(_) => {\n            Empty\n            Another\n        },\n        _ => {},\n    }\n}";
+        let formatted = format_dsl(input).unwrap();
+        assert_eq!(formatted, expected);
+        assert_eq!(format_dsl(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_attributes_on_layout_children() {
+        let input = "layout! { Root { #[cfg(target_os = \"macos\")] AppKitToolbar(.style=style) } }";
+        let expected = "layout! {\n    Root {\n        #[cfg(target_os = \"macos\")]\n        AppKitToolbar(.style = style)\n    }\n}";
         let formatted = format_dsl(input).unwrap();
         assert_eq!(formatted, expected);
         assert_eq!(format_dsl(&formatted).unwrap(), formatted);
